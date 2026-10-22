@@ -1,0 +1,8 @@
+# Python cache files
+__pycache__/
+**/__pycache__/
+
+# Compiled Python files
+*.pyc
+*.pyo
+*.pyd
