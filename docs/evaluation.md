@@ -3,7 +3,8 @@
 Evaluate the compressor in this order:
 
 1. Encode each complete document as chunks, then **prune summary slots using
-   the trained gating head**, before computing either metric.
+   the trained gating head**: remove the lowest-gated **K% per chunk** before
+   computing either metric. Test `K = 10, 25, 50, 75, 90`.
 2. Sample queries associated with held-out documents, rank the candidate
    documents by adapted-query MaxSim, and calculate **Precision@1**.
 3. Encode every document token with the **frozen original Qwen3 embedding
@@ -11,8 +12,9 @@ Evaluate the compressor in this order:
    all token matches and **coverage at a fixed similarity threshold**.
 
 This document specifies an evaluation procedure using the existing model APIs.
-The current scripts in [`src/eval/`](../src/eval/) provide inspection tools;
-they do not yet implement this complete evaluation. See
+Include an unpruned `K = 0` baseline in the percentage sweep. The procedure
+replaces the previous IQR outlier cutoff with an explicit number of slots to
+remove; the existing inspection scripts do not implement this full sweep. See
 [`compression.md`](compression.md) for the architecture and training losses.
 
 ## Inputs and model loading
@@ -27,7 +29,7 @@ Keep a fixed evaluation manifest containing:
 | Sampling | Random seed, document count, and queries sampled per document/type |
 | Coverage reference | Frozen original backbone identifier/revision and final hidden-state layer |
 | Coverage threshold | Prespecified cosine threshold `tau` in `[-1, 1]` |
-| Pruning policy | Per-chunk gate quartiles, linear interpolation, and IQR multiplier `1.5` |
+| Pruning policy | Per-chunk lowest-gate removal at `K = 0, 10, 25, 50, 75, 90` percent; floor rounding and stable slot-ID ties |
 
 Split by document before sampling evaluation queries. Documents, their duplicate
 bodies, and associated queries should be held out from compressor training.
@@ -83,50 +85,63 @@ The relevant chunkwise outputs are:
 | `b_d_tilde` | `(num_chunks, M, d)` | Gated summaries $b_{r,k}=\pi_{r,k}s_{r,k}$ |
 
 Here $M$ is `cfg.model.num_summary_tokens`, 32 by default. For **each chunk
-independently**, compute quartiles over its $M$ sigmoid gate outputs:
+independently**, sort its $M$ sigmoid gate outputs from lowest to highest.
+Break equal-gate ties by ascending original slot ID. For a requested removal
+percentage $K$, drop the first $n_{\mathrm{drop}}(K)$ slots:
 
 $$
-Q_{1,r}=\operatorname{quantile}_{0.25}(\pi_r),\qquad
-Q_{3,r}=\operatorname{quantile}_{0.75}(\pi_r),\qquad
-\operatorname{IQR}_r=Q_{3,r}-Q_{1,r}.
+n_{\mathrm{drop}}(K)=\min\left(M-1,\left\lfloor\frac{KM}{100}\right\rfloor\right),
+\qquad 0\leq K<100.
 $$
 
-The lower box-plot fence and retained slot set are
+Writing $a_r$ for that sorted list of original slot IDs, retain
 
 $$
-t_r=Q_{1,r}-1.5\operatorname{IQR}_r,\qquad
-\mathcal K_r=\{k:\pi_{r,k}\geq t_r\}.
+\mathcal K_r(K)=\{a_{r,n_{\mathrm{drop}}(K)+1},\ldots,a_{r,M}\}.
 $$
 
-Prune every slot **strictly below** the fence. Keep equality and do not prune
-high outliers. This procedure defines the quartile population per chunk,
-matching the chunk-local coverage definition below; do not pool gates across
-documents or evaluation batches. Use linear quantile interpolation and
-float32 gate values to make the rule reproducible.
+Select by **rank and count**, rather than comparing gates against a numeric
+percentile threshold: a threshold comparison can remove the wrong number when
+gates are tied. Equal gates still follow the requested count and deterministic
+tie rule. The retained sets are nested as K increases. Do not pool gates across
+chunks, documents, or evaluation batches.
 
-This is a relative outlier rule, not a fixed retention budget. It may prune
-nothing, including when the fence is negative. Equal gates have zero IQR and
-are all retained. With finite, nonempty gates, at least one slot survives.
-Reject nonfinite outputs rather than inventing a fallback pruning policy.
+Floor rounding never removes more than the requested fraction, and at least
+one slot survives in every chunk. A one-slot chunk retains its slot for every
+allowed K. Reject empty or nonfinite gate outputs and percentages outside
+`[0, 100)`. For the default 32 slots:
+
+| Requested removal K | Slots removed per chunk | Slots retained per chunk | Actual removal |
+|---|---|---|---|
+| 0% (baseline) | 0 | 32 | 0% |
+| 10% | 3 | 29 | 9.375% |
+| 25% | 8 | 24 | 25% |
+| 50% | 16 | 16 | 50% |
+| 75% | 24 | 8 | 75% |
+| 90% | 28 | 4 | 87.5% |
 
 ```python
-def prune_chunk_summaries(doc_out):
-    # pi: (num_chunks, M); operate on sigmoid outputs, not gate logits.
-    pi = doc_out["pi"].float()
-    if not torch.isfinite(pi).all():
+import math
+
+
+def lowest_gate_keep_mask(gates, cut_percent):
+    # gates: (num_chunks, M), from the trained sigmoid gating head.
+    if gates.ndim != 2 or 0 in gates.shape:
+        raise ValueError("Expected nonempty chunk-by-slot gates")
+    if not torch.isfinite(gates).all():
         raise ValueError("Nonfinite gate outputs")
-    quartiles = torch.quantile(
-        pi, pi.new_tensor([0.25, 0.75]), dim=-1, interpolation="linear"
-    )
-    q1, q3 = quartiles.unbind(0)
-    lower_fence = q1 - 1.5 * (q3 - q1)
-    keep = pi >= lower_fence[:, None]
-    assert keep.any(dim=-1).all()
-    return keep, lower_fence
+    if not 0 <= cut_percent < 100:
+        raise ValueError("cut_percent must be in [0, 100)")
+    slots = gates.shape[-1]
+    n_drop = min(math.floor(slots * cut_percent / 100), slots - 1)
+    order = torch.argsort(gates, dim=-1, stable=True)
+    keep = torch.ones_like(gates, dtype=torch.bool)
+    keep.scatter_(1, order[:, :n_drop], False)
+    return keep
 
 
 @torch.inference_mode()
-def prepare_document(text):
+def prepare_document(text, cut_percent):
     encoded = tokenizer(
         text, add_special_tokens=False, truncation=False, return_tensors="pt"
     )
@@ -134,10 +149,10 @@ def prepare_document(text):
         input_ids=encoded["input_ids"].to(device),
         attention_mask=encoded["attention_mask"].to(device),
     )
-    keep, lower_fence = prune_chunk_summaries(doc_out)
+    keep = lowest_gate_keep_mask(doc_out["pi"], cut_percent)
     # This helper encodes one document. Combine its retained chunks for ranking.
     ranking_vectors = doc_out["b_d_tilde"][keep].float()
-    return doc_out, keep, lower_fence, ranking_vectors
+    return doc_out, keep, ranking_vectors
 ```
 
 Cache the retained vectors once per document and reuse them across queries.
@@ -228,8 +243,10 @@ def rank_query(query_text, document_cache):
     return sorted(scores.items(), key=lambda pair: (-pair[1], pair[0]))
 ```
 
-For example, build `document_cache[doc_id] = prepare_document(body)[3]` for
-each candidate before running the queries. The snippets assume evaluation
+For example, build
+`document_cache[doc_id] = prepare_document(body, cut_percent=25)[2]` for each
+candidate before running the queries. Rebuild the retained cache for each K
+while reusing the original encoded summaries. The snippets assume evaluation
 without an outer mixed-precision autocast context and finite model outputs.
 For larger corpora, batch scoring or use vector blocks while preserving the
 same maximum across every retained summary of each document.
@@ -398,10 +415,11 @@ token positions/strings/scores from that chunk. Derive these lists from
 **every true entry** of `matching_summaries`, not only each token's best slot.
 A token may match several summaries; count it once in chunk coverage.
 
-Export per-chunk `Q1`, `Q3`, IQR, lower fence, all gates, retained original
-slot IDs, slots before/after pruning, real/covered token counts, `tau`, and
-coverage. Optionally export the full real-token-by-retained-summary score
-matrix for threshold inspection.
+Export per-chunk requested `cut_percent`, actual removal fraction, all gates,
+retained and removed original slot IDs, slots before/after pruning,
+real/covered token counts, `tau`, and coverage. Include the removal percentage
+on the token and summary records, too. Optionally export the full
+real-token-by-retained-summary score matrix for threshold inspection.
 
 For document $D$, aggregate by real-token counts:
 
@@ -426,9 +444,51 @@ A complete evaluation should save:
 - Each retained summary's matching tokens, and document/corpus coverage totals.
 - Retained summary counts and the fraction removed, alongside quality metrics.
 
-An optional unpruned comparison can show the effect of pruning, using the
-same checkpoint, queries, candidates, teacher, and threshold. Label it
-separately: the primary results above always apply IQR pruning first.
+## Test the five removal percentages
+
+Evaluate `K = 10, 25, 50, 75, 90`, plus the unpruned `K = 0` baseline, against
+the same checkpoint, candidate list, sampled queries, frozen teacher, and fixed
+cosine threshold. K always means **percentage removed**, not percentage kept.
+
+1. Encode the candidate documents once, retaining their original gates,
+   ungated summaries, gated summaries, chunk IDs, and real-token masks.
+2. Encode the queries once with the trained adapter and the document chunks
+   once with the frozen original embedding teacher. Fix the sampled query
+   list and relevance judgments before the sweep.
+3. For each K, calculate a fresh keep mask from the **original** gates. Never
+   repeatedly prune an already-pruned representation: each percentage applies
+   to the original M slots in each chunk.
+4. Rank every candidate document with its retained gated summaries and record
+   Precision@1, including direct and indirect query results.
+5. Compare each chunk's teacher tokens with that same chunk's retained
+   ungated summaries. Record all token matches, chunk coverage, token micro
+   coverage, and document macro coverage at the unchanged cosine threshold.
+6. Record requested/actual removal percentages and total retained vectors.
+   Save token and summary records separately for each K so their matches remain
+   associated with the pruning setting that produced them.
+
+The gate-removal percentage K and cosine coverage threshold `tau` are separate
+settings. Changing K does not change `tau`. Because the retained sets are
+nested, coverage at fixed `tau` cannot increase as K increases; retrieval
+Precision@1 can move in either direction and must be measured.
+
+Use a comparison table with one row for each of `0, 10, 25, 50, 75, 90`, and
+the following columns:
+
+| Column | What to record |
+|---|---|
+| Requested removal K | Percentage of original summary slots requested for removal |
+| Actual removal | Removed slots divided by original slots after integer rounding |
+| Retained vectors | Total count and mean count per chunk |
+| Precision@1 | Overall, direct, and indirect query results |
+| Precision@1 loss | `P@1(K=0) - P@1(K)` in percentage points |
+| Coverage at fixed tau | Token micro coverage and document macro coverage |
+| Coverage loss | Unpruned coverage minus coverage at K, in percentage points |
+
+Compare quality and retained-vector counts against `K = 0`, then select the
+largest removal percentage meeting the validation quality tolerances. Keep
+the final test set separate from this selection. Report actual removal
+fractions, particularly for percentages affected by integer rounding.
 
 The existing `inspect_bottleneck` and `sample_beir_compress` visualizations
 use raw input-embedding comparisons and selected high-gate slots. Their HTML
