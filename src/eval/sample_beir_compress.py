@@ -9,8 +9,8 @@ there. Samples --num-samples documents, runs each through
 LatentBottleneckReranker.encode_document, and reports per-document gate
 (pi) statistics plus the nearest vocabulary term for the single
 highest-gated slot (a cheap one-slot flavor of
-inspect_bottleneck.py's full nearest-neighbor table, reusing its
-rogue-dimension-corrected `_cos`).
+inspect_bottleneck.py's full nearest-neighbor table, using ordinary cosine
+similarity against raw embeddings).
 
 Usage:
     python -m src.eval.sample_beir_compress \
@@ -49,11 +49,11 @@ def _doc_text(doc):
 
 
 @torch.no_grad()
-def compress_one(model, tokenizer, text, doc_max_len, embed_table):
-    enc = tokenizer(text, add_special_tokens=False, truncation=True, max_length=doc_max_len, return_tensors="pt")
+def compress_one(model, tokenizer, text, doc_chunk_size, embed_table):
+    enc = tokenizer(text, add_special_tokens=False, truncation=False, return_tensors="pt")
     doc_out = model.encode_document(enc["input_ids"], enc["attention_mask"])
-    pi = doc_out["pi"][0]
-    b_d = doc_out["b_d"][0]
+    pi = doc_out["pi"].reshape(-1)
+    b_d = doc_out["b_d"].reshape(-1, doc_out["b_d"].shape[-1])
 
     top_slot = int(pi.argmax().item())
     sim = _cos(b_d[top_slot : top_slot + 1], embed_table)[0]
@@ -63,6 +63,7 @@ def compress_one(model, tokenizer, text, doc_max_len, embed_table):
     n = len(vals)
     return {
         "n_tokens": int(enc["attention_mask"].sum().item()),
+        "n_chunks": int(doc_out["pi"].shape[0]),
         "pi_mean": sum(vals) / n,
         "pi_min": min(vals),
         "pi_max": max(vals),
@@ -112,7 +113,7 @@ def main():
         text = _doc_text(corpus[doc_id])
         if not text:
             continue
-        stats = compress_one(model, tokenizer, text, cfg.model.doc_max_len, embed_table)
+        stats = compress_one(model, tokenizer, text, cfg.model.doc_chunk_size, embed_table)
         stats["doc_id"] = doc_id
         rows.append(stats)
         print(
@@ -127,7 +128,7 @@ def main():
     print(f"[sample_beir] #slots>0.5 per doc: avg={sum(n_gt_05) / len(n_gt_05):.1f} min={min(n_gt_05)} max={max(n_gt_05)}")
 
     if args.out_csv:
-        fieldnames = ["doc_id", "n_tokens", "pi_mean", "pi_min", "pi_max", "n_slots_gt_0.5", "n_slots_gt_0.1", "top_slot", "top_slot_vocab"]
+        fieldnames = ["doc_id", "n_tokens", "n_chunks", "pi_mean", "pi_min", "pi_max", "n_slots_gt_0.5", "n_slots_gt_0.1", "top_slot", "top_slot_vocab"]
         with open(args.out_csv, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
@@ -140,7 +141,7 @@ def main():
         for doc_id in viz_ids:
             text = _doc_text(corpus[doc_id])
             viz_rows, doc_tokens, sim_doc, order, pi = inspect(
-                model, tokenizer, text, cfg.model.doc_max_len, args.viz_top_k, args.viz_vocab_top_k
+                model, tokenizer, text, cfg.model.doc_chunk_size, args.viz_top_k, args.viz_vocab_top_k
             )
             sections.append((doc_id, doc_tokens, sim_doc, order, pi, viz_rows))
         save_multi_doc_html(args.out_html, sections)

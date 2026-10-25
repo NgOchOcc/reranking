@@ -19,10 +19,9 @@ zero -- and undefined direction -- for a fully pruned slot):
      in the same transformer's residual stream), which dominate raw cosine
      similarity and collapse every token to ~1.0 against a single slot.
      Raw embeddings don't carry those dims, so this comparison isn't
-     inflated the same way -- at the cost of losing h_d's contextualization
-     (losses.idf_weighted_chamfer_loss's precision term still argmins over
-     h_d directly, since that loss isn't a nearest-neighbor *display* and
-     doesn't suffer the same interpretability problem).
+     inflated the same way -- at the cost of losing h_d's contextualization.
+     Training coverage compares contextualized tokens against their own
+     chunk summaries; the display is a separate interpretability heuristic.
 
 Usage:
     python -m src.eval.inspect_bottleneck \
@@ -61,10 +60,10 @@ def _cos(a, b):
 
 
 @torch.no_grad()
-def compute_gates(model, tokenizer, text, doc_max_len):
-    enc = tokenizer(text, add_special_tokens=False, truncation=True, max_length=doc_max_len, return_tensors="pt")
+def compute_gates(model, tokenizer, text, doc_chunk_size):
+    enc = tokenizer(text, add_special_tokens=False, truncation=False, return_tensors="pt")
     doc_out = model.encode_document(enc["input_ids"], enc["attention_mask"])
-    return doc_out["pi"][0]  # (M,)
+    return doc_out["pi"].reshape(-1)  # (J_D * M,)
 
 
 def print_gate_summary(pi):
@@ -81,13 +80,13 @@ def print_gate_summary(pi):
 
 
 @torch.no_grad()
-def inspect(model, tokenizer, text, doc_max_len, top_k, vocab_top_k):
-    enc = tokenizer(text, add_special_tokens=False, truncation=True, max_length=doc_max_len, return_tensors="pt")
+def inspect(model, tokenizer, text, doc_chunk_size, top_k, vocab_top_k):
+    enc = tokenizer(text, add_special_tokens=False, truncation=False, return_tensors="pt")
     input_ids, attention_mask = enc["input_ids"], enc["attention_mask"]
     doc_out = model.encode_document(input_ids, attention_mask)
 
-    b_d = doc_out["b_d"][0]  # (M, d) -- gate-invariant direction, see module docstring
-    pi = doc_out["pi"][0]  # (M,)
+    b_d = doc_out["b_d"].reshape(-1, doc_out["b_d"].shape[-1])  # (J_D * M, d), ungated
+    pi = doc_out["pi"].reshape(-1)  # (J_D * M,)
     mask = attention_mask[0].bool()
 
     n_real = int(mask.sum().item())
@@ -121,17 +120,15 @@ def inspect(model, tokenizer, text, doc_max_len, top_k, vocab_top_k):
 
 
 @torch.no_grad()
-def compute_norms(model, tokenizer, text, doc_max_len):
+def compute_norms(model, tokenizer, text, doc_chunk_size):
     """L2 norm of every compressed bottleneck vector (b_d, pre-gate) vs
     every real document hidden state (h_d) -- a scale check: do the two
     populations even live at comparable magnitudes, or is one systematically
     larger (which would itself skew raw cosine comparisons between them)."""
-    enc = tokenizer(text, add_special_tokens=False, truncation=True, max_length=doc_max_len, return_tensors="pt")
+    enc = tokenizer(text, add_special_tokens=False, truncation=False, return_tensors="pt")
     doc_out = model.encode_document(enc["input_ids"], enc["attention_mask"])
-    n_real = int(enc["attention_mask"][0].sum().item())
-
-    b_d = doc_out["b_d"][0]  # (M, d)
-    h_d = doc_out["h_d"][0][:n_real]  # (L, d)
+    b_d = doc_out["b_d"].reshape(-1, doc_out["b_d"].shape[-1])  # (M, d)
+    h_d = doc_out["h_d"][doc_out["doc_attention_mask"].bool()]  # all real chunk tokens
     return b_d.norm(dim=-1), h_d.norm(dim=-1)
 
 
@@ -221,16 +218,16 @@ def save_heatmap(path, doc_tokens, sim_doc, order, pi, max_doc_tokens=60):
 
 
 @torch.no_grad()
-def probe_token_vs_top_slots(model, tokenizer, text, doc_max_len, token_str, top_k):
+def probe_token_vs_top_slots(model, tokenizer, text, doc_chunk_size, token_str, top_k):
     """Looks `token_str` up in the backbone's (tied) input embedding table
     and scores it (cosine) against this document's top-`top_k` bottleneck
     slots, ranked by gate pi. Returns (scores, slots, pi_vals) -- same
     shape of info `inspect()` returns per-slot, just for one externally
     chosen token instead of every document token."""
-    enc = tokenizer(text, add_special_tokens=False, truncation=True, max_length=doc_max_len, return_tensors="pt")
+    enc = tokenizer(text, add_special_tokens=False, truncation=False, return_tensors="pt")
     doc_out = model.encode_document(enc["input_ids"], enc["attention_mask"])
-    pi = doc_out["pi"][0]  # (M,)
-    b_d = doc_out["b_d"][0]  # (M, d)
+    pi = doc_out["pi"].reshape(-1)  # (M,)
+    b_d = doc_out["b_d"].reshape(-1, doc_out["b_d"].shape[-1])  # (M, d)
 
     token_ids = tokenizer.encode(token_str, add_special_tokens=False)
     if len(token_ids) != 1:
@@ -453,18 +450,18 @@ def main():
     text = _load_text(args)
 
     if args.probe_token:
-        scores, slots, pi_vals = probe_token_vs_top_slots(model, tokenizer, text, cfg.model.doc_max_len, args.probe_token, args.probe_top_k)
+        scores, slots, pi_vals = probe_token_vs_top_slots(model, tokenizer, text, cfg.model.doc_chunk_size, args.probe_token, args.probe_top_k)
         out_path = args.out_token_plot or f"{args.probe_token}_vs_slots.png"
         plot_token_vs_slots(out_path, args.probe_token, scores, slots, pi_vals)
         print(f"[inspect] saved token-vs-slots plot -> {out_path}")
 
     if args.pi_only:
-        pi = compute_gates(model, tokenizer, text, cfg.model.doc_max_len)
+        pi = compute_gates(model, tokenizer, text, cfg.model.doc_chunk_size)
         print_gate_summary(pi)
         return
 
     if args.compare_norms:
-        b_norms, h_norms = compute_norms(model, tokenizer, text, cfg.model.doc_max_len)
+        b_norms, h_norms = compute_norms(model, tokenizer, text, cfg.model.doc_chunk_size)
         print_norm_comparison(b_norms, h_norms)
         if args.out_norm_plot:
             plot_norm_histogram(args.out_norm_plot, b_norms, h_norms)
@@ -472,7 +469,7 @@ def main():
         return
 
     rows, doc_tokens, sim_doc, order, pi = inspect(
-        model, tokenizer, text, cfg.model.doc_max_len, args.top_k, args.vocab_top_k,
+        model, tokenizer, text, cfg.model.doc_chunk_size, args.top_k, args.vocab_top_k,
     )
     print_table(rows)
 

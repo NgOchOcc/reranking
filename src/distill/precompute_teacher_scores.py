@@ -74,6 +74,11 @@ def _score_chunk(teacher, records, score_batch_size):
         batch_d = pairs_d[start:start + score_batch_size]
         scores.extend(teacher.score_batch(batch_q, batch_d))
 
+    if len(scores) != len(locs):
+        raise ValueError("Teacher returned a different number of scores than query-document pairs")
+    metadata = _teacher_metadata(teacher.cfg)
+    for record in records:
+        record["teacher_metadata"] = metadata.copy()
     for (r_idx, slot, q_idx), score in zip(locs, scores):
         if q_idx is None:
             records[r_idx]["teacher_scores"][slot] = score
@@ -82,13 +87,38 @@ def _score_chunk(teacher, records, score_batch_size):
     return records
 
 
+def _teacher_metadata(cfg):
+    return {
+        "teacher_name": cfg.teacher_name,
+        "instruction": cfg.instruction,
+        "max_length": cfg.max_length,
+        "document_scope": "full_document",
+    }
+
+
+def _validate_resume(path, cfg):
+    """Do not append full-document scores to legacy prefix-scored outputs."""
+    expected = _teacher_metadata(cfg)
+    if not os.path.exists(path):
+        return
+    with open(path) as source:
+        for line_number, line in enumerate(source, 1):
+            if not line.strip():
+                continue
+            if json.loads(line).get("teacher_metadata") != expected:
+                raise ValueError(
+                    f"Existing teacher output line {line_number} has legacy or different scoring settings; "
+                    "use a new output path or --overwrite to regenerate full-document targets."
+                )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--unified", default="data/unified_examples.jsonl")
     ap.add_argument("--out", default="data/unified_examples.scored.jsonl")
     ap.add_argument("--teacher", default="Qwen/Qwen3-Reranker-8B")
     ap.add_argument("--instruction", default="Given a web search query, retrieve relevant passages that answer the query")
-    ap.add_argument("--max-length", type=int, default=4096)
+    ap.add_argument("--max-length", type=int, default=TeacherConfig().max_length)
     ap.add_argument("--torch-dtype", default="bfloat16")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--neg-per-keypoint", type=int, default=2)
@@ -98,6 +128,10 @@ def main():
     ap.add_argument("--limit", type=int, default=None, help="cap total records processed, for smoke tests")
     ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args()
+    if args.score_batch_size <= 0 or args.chunk_records <= 0:
+        ap.error("--score-batch-size and --chunk-records must be positive")
+    if args.neg_per_keypoint < 0 or args.hardneg_per_keypoint < 0:
+        ap.error("negative-query limits must be nonnegative")
 
     if args.overwrite and os.path.exists(args.out):
         os.remove(args.out)
@@ -109,6 +143,7 @@ def main():
         teacher_name=args.teacher, instruction=args.instruction, max_length=args.max_length,
         torch_dtype=args.torch_dtype,
     )
+    _validate_resume(args.out, teacher_cfg)
     teacher = QwenRerankerTeacher(teacher_cfg, device=args.device)
 
     n_unified = _count_lines(args.unified)
@@ -120,7 +155,7 @@ def main():
     with open(args.out, "a") as out_f:
         pbar = tqdm(desc="[precompute_teacher] scoring", initial=n_done, total=total_target)
         for rec in _iter_records(args.unified, skip=n_done):
-            if total_target is not None and n_total >= total_target:
+            if total_target is not None and n_total + len(chunk) >= total_target:
                 break
             rec["negative_queries"] = rec["negative_queries"][: args.neg_per_keypoint]
             rec["hard_negative_queries"] = rec["hard_negative_queries"][: args.hardneg_per_keypoint]

@@ -1,19 +1,19 @@
 model:
-  backbone_name: "Qwen/Qwen3-0.6B"
+  backbone_name: "Qwen/Qwen3-Embedding-0.6B"
   hidden_size: 1024
-  num_summary_tokens: 256
+  num_summary_tokens: 32
   query_max_len: 32
   n_query_adapter_layers: 2
   n_query_adapter_heads: 8
   n_cross_attn_layers: 1
   n_cross_attn_heads: 8
-  doc_max_len: 768
+  doc_chunk_size: 1024
   mask_token: "<|vision_pad|>"
 
 teacher:
   teacher_name: "Qwen/Qwen3-Reranker-8B"
   instruction: "Given a web search query, retrieve relevant passages that answer the query"
-  max_length: 1024
+  max_length: 32768
   torch_dtype: "bfloat16"
   batch_size: 16
 
@@ -23,14 +23,16 @@ data:
   unified_path: "data/unified_examples.jsonl"
   idf_path: "data/idf_table.pt"
   scored_path: "data/unified_examples.scored.jsonl"
+  # Optional JSON/JSONL mapping doc_id to one main keypoint.
+  # Alternatively, supply main_keypoint on every scored row.
+  main_keypoints_path: null
   neg_per_keypoint: 2
   hardneg_per_keypoint: 2
 
 loss:
-  lambda_chamfer: 1.0
-  lambda_consistency: 0.5
+  lambda_coverage: 1.0
+  lambda_keypoint: 1.0
   lambda_sparsity: 0.01
-  chamfer_beta: 1.0
 
 train:
   output_dir: "runs/default"

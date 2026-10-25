@@ -15,15 +15,15 @@ import yaml
 
 @dataclass
 class ModelConfig:
-    backbone_name: str = "Qwen/Qwen3-0.6B"
+    backbone_name: str = "Qwen/Qwen3-Embedding-0.6B"
     hidden_size: int = 1024
-    num_summary_tokens: int = 256
+    num_summary_tokens: int = 32
     query_max_len: int = 32
     n_query_adapter_layers: int = 2
     n_query_adapter_heads: int = 8
     n_cross_attn_layers: int = 1
     n_cross_attn_heads: int = 8
-    doc_max_len: int = 512
+    doc_chunk_size: int = 1024
     # Reused as the fixed [MASK] pad slot for the query side (Eq. 1): an
     # existing, already-trained, otherwise-unused Qwen3 special token, so we
     # avoid growing the vocab / resizing the tied embedding matrix.
@@ -34,7 +34,7 @@ class ModelConfig:
 class TeacherConfig:
     teacher_name: str = "Qwen/Qwen3-Reranker-8B"
     instruction: str = "Given a web search query, retrieve relevant passages that answer the query"
-    max_length: int = 4096
+    max_length: int = 32768
     torch_dtype: str = "bfloat16"
     batch_size: int = 16
 
@@ -46,16 +46,16 @@ class DataConfig:
     unified_path: str = "data/unified_examples.jsonl"
     idf_path: str = "data/idf_table.pt"
     scored_path: str = "data/unified_examples.scored.jsonl"
+    main_keypoints_path: Optional[str] = None
     neg_per_keypoint: int = 2
     hardneg_per_keypoint: int = 2
 
 
 @dataclass
 class LossConfig:
-    lambda_chamfer: float = 1.0
-    lambda_consistency: float = 0.5
+    lambda_coverage: float = 1.0
+    lambda_keypoint: float = 1.0
     lambda_sparsity: float = 0.01
-    chamfer_beta: float = 1.0
 
 
 @dataclass

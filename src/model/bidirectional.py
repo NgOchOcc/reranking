@@ -1,18 +1,7 @@
-"""Turn a (causal) Qwen3 transformer backbone into a bidirectional encoder.
+"""Use padding-only attention for document chunks and whole keypoints.
 
-Qwen3-0.6B is pretrained as a causal LM, but the proposal's document encoder
-(Eq. 3, "stacked self-attention layers ... contextualized token embeddings")
-needs full-context, both-directions attention to resolve coreferences
-across the whole document (see §1/§4 motivation). This is the standard
-"bidirectionalize a decoder LM" trick (cf. LLM2Vec): we replace
-`Qwen3Model._update_causal_mask` with a version that builds a padding-only
-additive mask (no causal/triangular component). Every decoder layer in
-`Qwen3Model.forward` consumes whatever mask this method returns, under both
-the eager and sdpa attention backends, so this one patch point is
-sufficient regardless of backend.
-
-Safe to do here because the backbone is fully unfrozen and fine-tuned for
-this task anyway, so it can adapt away from its pretrained causal prior.
+This patch targets Qwen3's _update_causal_mask interface. The model loader
+selects SDPA, which accepts its explicit four-dimensional additive mask.
 """
 import types
 
@@ -21,7 +10,9 @@ import torch
 
 def _bidirectional_update_causal_mask(self, attention_mask, input_tensor, cache_position, past_key_values, output_attentions=False):
     if attention_mask is None:
-        return None
+        attention_mask = torch.ones(
+            input_tensor.shape[:2], dtype=torch.long, device=input_tensor.device
+        )
     dtype = input_tensor.dtype
     min_dtype = torch.finfo(dtype).min
     seq_len = attention_mask.shape[-1]
@@ -36,4 +27,8 @@ def make_bidirectional(backbone):
     if not hasattr(backbone, "_update_causal_mask"):
         raise TypeError(f"{type(backbone)} has no _update_causal_mask to patch")
     backbone._update_causal_mask = types.MethodType(_bidirectional_update_causal_mask, backbone)
+    backbone.config.use_cache = False
+    for layer in getattr(backbone, "layers", []):
+        if hasattr(layer, "self_attn"):
+            layer.self_attn.is_causal = False
     return backbone

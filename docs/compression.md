@@ -1,21 +1,25 @@
 # Latent Bottleneck Compression: Theory and Implementation
 
-This repository trains a reranker that represents a document with a bounded set
-of learned vectors. A short query is encoded separately, and relevance is
-computed by matching each query vector to its best document vector. The main
-idea is to retain the fine-grained matching of a multi-vector model while
-limiting how many document vectors must be stored and scored.
+The revised design represents each fixed-size document chunk with a bounded
+set of learned vectors. A short query is encoded separately, and relevance is
+computed by matching each query vector to its best summary vector across the
+document's chunks. The main idea is to retain fine-grained matching while
+limiting the vector budget per chunk.
 
-This document explains the current Python implementation. Architectural motivations
-are distinguished from properties that the losses actually enforce. The
-repository does not include measured ranking or edge-latency results.
+Part 1 specifies the revised theory: chunk-based compression, summary blocks
+with cross-attention and self-attention, and four losses: soft-target binary
+cross-entropy, token-weighted coverage, keypoint matching, and gate sparsity.
+Part 2 describes the corresponding Python implementation, its data formats,
+and the training and inference APIs. Architectural motivations are
+distinguished from properties that the losses actually enforce. The repository
+does not include measured ranking or edge-latency results.
 
 - [Part 1: Theory](#part-1-theory)
 - [Part 2: Implementation](#part-2-implementation)
 
 ## Part 1: Theory
 
-### 1.1 The problem: preserve evidence within a fixed vector budget
+### 1.1 The problem: preserve evidence within a fixed vector budget per chunk
 
 A reranker assigns a relevance score to a query and each candidate document.
 Sorting these scores produces the final candidate ordering. The challenge is
@@ -31,10 +35,12 @@ Three representation choices explain the motivation:
 | Token-level late interaction | Encode independently, retain a document vector for each token, then match query vectors to document vectors. | Fine-grained matching, but storage and scoring grow with document length. |
 
 This project takes the third approach and changes its document representation.
-Instead of retaining every contextualized document token, it learns a fixed
-number of summary vectors, called **bottleneck slots**. Each slot can gather
-information from the whole encoded document window rather than from one
-predefined paragraph.
+An arbitrary-length document is first split into fixed-size token chunks,
+for example 1,024 tokens per chunk. The same compressor maps each chunk to a
+fixed number of summary vectors, called **bottleneck slots**. Each slot can
+gather information from anywhere within its chunk. Compression is performed
+independently for every chunk; the vector budget is fixed per chunk rather
+than for the entire document.
 
 For example, consider a document that says:
 
@@ -44,54 +50,82 @@ For example, consider a document that says:
 A direct query might ask for Borealis's sensor process. An indirect query might
 ask which instrument followed Aurora and when it launched. Useful compression
 must support the relationship across sentences while preserving the specific
-values `2019`, `three years`, and `14 nm`. Training only on a few generated
-questions could overlook a value that no question happens to mention.
+values `2019`, `three years`, and `14 nm` when this evidence falls within the
+same chunk. Chunk boundaries limit contextual reasoning: tokens in different
+chunks do not attend to one another during encoding. Training only on a few
+generated questions could overlook a value that no question happens to mention.
 
-The model therefore combines relevance supervision with a geometric objective
-that encourages coverage of the original token representations. This is lossy
-representation learning: it does not reconstruct the document text, quantize
-model weights, or produce a textual summary.
+The model therefore combines relevance supervision, token coverage,
+document-level keypoint matching, and a sparsity penalty on the gates.
+Keypoints identify the main facts that the summaries should retain. This is
+lossy representation learning: it does not reconstruct document text,
+quantize model weights, or produce a textual summary.
 
 ### 1.2 Notation and the complete model
 
-| Symbol | Meaning | Default in `configs/default.yaml` |
+| Symbol | Meaning | Revised design / example |
 |---|---|---|
 | $Q$ | Query text | — |
-| $D$ | Document text | — |
+| $D$ | Full document text | Arbitrary token length $N_D$ |
+| $C$ | Fixed chunk size in student-tokenizer tokens | 1,024 |
+| $J_D$ | Number of nonempty chunks in $D$ | $\lceil N_D/C\rceil$ |
+| $C_r$ | Chunk $r$ of document $D$ | $1\leq r\leq J_D$ |
+| $\ell_r$ | Number of real tokens in chunk $r$ | $1\leq\ell_r\leq C$ |
 | $L_Q$ | Fixed number of query slots | 32 |
-| $L_D$ | Number of real document tokens retained after truncation | At most 768 |
 | $d$ | Vector width | 1024 |
-| $M$ | Number of bottleneck slots | 256 |
-| $H_D$ | Contextualized document tokens | $L_D \times d$ before batching padding |
-| $B_D$ | Bottleneck vectors before gating | $M \times d$ |
-| $\pi_D$ | Continuous gate values | $M$ |
-| $\widetilde B_D$ | Bottleneck after multiplicative gating | $M \times d$ |
-| $Q_{\mathrm{latent}}$ | Encoded query vectors | $L_Q \times d$ |
-| $S(Q,D)$ | Student relevance score | One scalar |
-| $T(Q,D)$ | Discriminative teacher's relevance score | A yes/no probability |
+| $M$ | Number of bottleneck slots per chunk | 32 |
+| $L$ | Number of summary refinement blocks | Configurable |
+| $H_r$ | Contextualized tokens of chunk $r$ | $\ell_r\times d$ before padding |
+| $S_r=Z_r^{(L)}$ | Chunk summaries before gating | $M\times d$ |
+| $\pi_r$ | Continuous gate values for chunk $r$ | $M$ |
+| $B_r$ | Chunk bottleneck after multiplicative gating | $M\times d$ |
+| $S_D$ | Concatenated chunk summaries before gating | $(J_DM)\times d$ |
+| $\pi_D$ | Concatenated chunk gate values | $J_DM$ |
+| $B_D$ | Gated document summaries | $\operatorname{diag}(\pi_D)S_D\in\mathbb R^{(J_DM)\times d}$ |
+| $f_D$ | Main keypoint text associated with document $D$ | Supplied in JSON |
+| $L_f$ | Number of real tokens in $f_D$ | Full keypoint length |
+| $U_f$ | Contextualized keypoint token vectors | $L_f\times d$, shared full encoder |
+| $Q_{\mathrm{latent}}$ | Encoded query vectors | $L_Q\times d$ |
+| $S_\theta(Q,D)$ | Raw student MaxSim relevance score | One unbounded scalar |
+| $a,b$ | Globally shared trainable score scale and bias | $a>0$, $b\in\mathbb R$ |
+| $z_\theta(Q,D)$ | Student relevance logit | $aS_\theta(Q,D)+b$ |
+| $p_\theta(Q,D)$ | Student relevance probability | $\sigma(z_\theta(Q,D))$ |
+| $p_T(Q,D)$ | Frozen discriminative teacher target | A yes/no probability |
 
-The student has two paths that meet only at scoring:
+The relevance model has separate query and document paths, with an additional
+keypoint branch during training:
 
 ```mermaid
 flowchart LR
-    D[Document token IDs] --> ED[Document Transformer]
-    ED --> H[Contextualized tokens H_D]
-    SQ[Learned summary queries] --> CA[Cross-attention extraction]
+    D[Full document token IDs] --> CH[Split into fixed-size chunks]
+    CH --> ED[Shared document Transformer per chunk]
+    ED --> H[Contextualized chunk tokens H_r]
+    SQ[Shared learned summary queries] --> CA[Cross-attention, FFN1, self-attention, FFN2]
     H --> CA
-    CA --> BD[Bottleneck B_D]
+    CA --> BD[Ungated chunk summaries S_r]
     BD --> G[Linear head and sigmoid]
     BD --> MUL[Multiply each slot by its gate]
     G --> MUL
+    MUL --> CAT[Concatenate all chunk summaries]
     Q[Query token IDs] --> E[Shared embedding lookup]
     E --> A[Residual query adapter]
-    A --> MS[MaxSim score]
-    MUL --> MS
+    A --> MS[Document MaxSim score]
+    CAT --> MS
+    MS --> Z[Trainable positive scale and bias]
+    Z --> P[Sigmoid relevance probability]
+    F[Main keypoint token IDs] --> KE[Same full encoder on whole keypoint]
+    KE --> U[Contextualized keypoint tokens]
+    U --> KM[Mean tokenwise cosine MaxSim]
+    CAT --> KM
+    KM --> KL[Keypoint loss]
+    G --> SP[Summed-gate sparsity loss]
 ```
 
 The document representation is **query independent**. A particular query does
-not influence which document vectors the compressor produces. This allows
-document compression to be moved offline in a serving system, although this
-repository does not yet implement a persistent compressed-document index.
+not influence which vectors the compressor produces. All chunks share the
+compressor parameters, allowing their representations to be computed offline.
+A document with $J_D$ chunks has $J_DM$ vectors before any external pruning;
+only the per-chunk count is fixed.
 
 ### 1.3 Query encoding: a shallow residual adapter
 
@@ -133,146 +167,214 @@ and feed-forward width $4d$. Two details affect the theory of this query path:
   query word order. The full document backbone still has its own positional
   machinery.
 
-### 1.4 Document compression in three stages
+### 1.4 Chunk-based document compression
 
-#### Stage A: contextualize the document
+#### Stage A: split the document and contextualize each chunk
 
-The document backbone produces one contextualized vector for each input token:
-
-$$
-H_D = E_D(D) = [h_1,\ldots,h_{L_D}].
-$$
-
-The default student backbone is `Qwen/Qwen3-0.6B`. The implementation attempts
-to turn its causal attention into bidirectional attention by replacing its
-causal-mask construction with a padding-only mask. The intended result is that
-each real token can incorporate evidence both before and after its position.
-This is useful for references such as “its successor” in the example above.
-
-The document backbone is fully trainable. The system does not freeze it as a
-fixed feature extractor. “Whole-document context” here means the retained
-token window: with the checked-in YAML configuration, text beyond 768 tokens
-is truncated before the student sees it.
-
-#### Stage B: extract a fixed set of summary vectors
-
-The compressor owns a learned matrix of summary queries:
+Tokenize the full document once with the student tokenizer, obtaining
+$t_1,\ldots,t_{N_D}$. For a nonempty document, split the sequence into
+consecutive, nonoverlapping chunks:
 
 $$
-S_0 = [s_1,\ldots,s_M] \in \mathbb R^{M\times d}.
+C_r = [t_{(r-1)C+1},\ldots,t_{\min(rC,N_D)}],
+\qquad r=1,\ldots,J_D.
 $$
 
-These are model parameters shared across documents. They are not text tokens
-and do not occupy positions in the document input. Cross-attention converts
-them into document-specific vectors.
+Every full chunk has exactly $C=1024$ tokens in this example. Right-pad the
+last chunk to $C$ when needed and retain a validity mask. Padding is excluded
+from document attention keys and the coverage loss. No document tokens are
+discarded merely because the document is longer than one chunk.
 
-For a single attention head, the core operation is:
+The shared document backbone independently produces contextualized vectors
+for each chunk:
 
 $$
-\operatorname{Attention}(Q_s,K_D,V_D)
+H_r = E_D(C_r) = [h_{r,1},\ldots,h_{r,\ell_r}].
+$$
+
+The student backbone is `Qwen/Qwen3-Embedding-0.6B`, with bidirectional
+attention within each chunk and fully trainable weights. Each real token can incorporate
+evidence before and after its position within that chunk. The chunk encoder
+has no access to tokens in another chunk, so it does not provide contextual
+reasoning across chunk boundaries.
+
+#### Stage B: extract and refine a fixed set of summary vectors
+
+The compressor owns a learned matrix of initial summary queries:
+
+$$
+Z^{(0)} = [s_1,\ldots,s_M] \in \mathbb R^{M\times d},
+\qquad Z_r^{(0)}=Z^{(0)}.
+$$
+
+These are model parameters shared across all chunks and documents. They are
+not text tokens and do not occupy positions in a chunk's input. Each chunk
+starts from the same learned matrix, then refines it using that chunk's $H_r$.
+
+For a single cross-attention head, the core operation is:
+
+$$
+\operatorname{Attention}(Q_s,K_r,V_r)
 = \operatorname{softmax}
-\left(\frac{Q_s K_D^\top}{\sqrt{d_h}} + A_D\right)V_D,
+\left(\frac{Q_s K_r^\top}{\sqrt{d_h}} + A_r\right)V_r,
 $$
 
-where $Q_s$ comes from the summary vectors, $K_D$ and $V_D$ come from the
-contextualized document, $d_h$ is the head width, and $A_D$ excludes padded
-document keys. Multiple heads provide separate learned projections of the
+where $Q_s$ comes from the summary vectors, $K_r$ and $V_r$ come from the
+contextualized chunk, $d_h$ is the head width, and $A_r$ excludes padded
+chunk keys. Multiple heads provide separate learned projections of the
 same inputs.
 
-The actual block uses normalization and residual updates:
+Each refinement block has four pre-normalized residual sublayers, in this
+order, for $\ell=0,\ldots,L-1$:
 
 $$
 \begin{aligned}
-R &= S + \operatorname{MHCA}
-   (\operatorname{LN}_q(S),\operatorname{LN}_{kv}(H_D),
-    \operatorname{LN}_{kv}(H_D)),\\
-S' &= R + \operatorname{FFN}(\operatorname{LN}_{ffn}(R)).
+R_r^{(\ell)} &= Z_r^{(\ell)} + \operatorname{CrossAttn}
+   (\operatorname{LN}(Z_r^{(\ell)}),\operatorname{LN}(H_r),
+    \operatorname{LN}(H_r)),\\
+U_r^{(\ell)} &= R_r^{(\ell)}
+   + \operatorname{FFN}_1(\operatorname{LN}(R_r^{(\ell)})),\\
+V_r^{(\ell)} &= U_r^{(\ell)}
+   + \operatorname{SelfAttn}(\operatorname{LN}(U_r^{(\ell)})),\\
+Z_r^{(\ell+1)} &= V_r^{(\ell)}
+   + \operatorname{FFN}_2(\operatorname{LN}(V_r^{(\ell)})).
 \end{aligned}
 $$
 
-The FFN is `Linear(d, 4d) → GELU → Linear(4d, d)`. After the configured
-number of blocks, the final summary matrix is $B_D$.
+Here $\operatorname{SelfAttn}(X)$ uses $X$ as queries, keys, and values, so
+the $M$ summary slots communicate with one another within a chunk.
+Cross-attention reads chunk evidence; summary self-attention lets the
+extracted summaries exchange information before the next block. Each
+sublayer has its own learned normalization parameters, with the key/value
+normalization shared within a cross-attention sublayer.
+$\operatorname{FFN}_1$ and $\operatorname{FFN}_2$ are separate networks,
+each `Linear(d, 4d) → GELU → Linear(4d, d)`.
 
-Every summary slot can attend across the retained document window. A slot
-does not correspond to a fixed span, and a summary vector need not correspond
-to a single word. The slots may combine related evidence from distant
-positions. The code does not impose a distinct fact per slot or an explicit
-diversity constraint, so specialization is learned rather than guaranteed.
+After $L$ blocks, the chunk summary matrix is:
+
+$$
+S_r = Z_r^{(L)} \in \mathbb R^{M\times d}.
+$$
+
+This is the reference architecture's final summary matrix $S=Z^{(L)}$,
+written $S_r$ for chunk $r$. The scalar relevance score remains
+$S_\theta(Q,D)$. The reference's $K$ slots and width $D$ correspond to
+$M$ and $d$ here. Every slot can attend across its chunk, but slots in
+different chunks never interact inside the compressor. A slot need not
+correspond to a fixed span or a single word. Distinct facts per slot and
+specialization remain learned behavior rather than guaranteed properties.
 
 #### Stage C: predict continuous retention gates
 
 A shared linear head predicts one scalar per slot:
 
 $$
-\pi_k = \sigma(w_g^\top b_k+c_g),
+\pi_{r,k} = \sigma(w_g^\top s_{r,k}+c_g),
 \qquad
-\widetilde b_k = \pi_k b_k.
+b_{r,k} = \pi_{r,k} s_{r,k}.
 $$
 
 The sigmoid makes the operation differentiable. The same slot can receive a
-different gate for each document because its vector $b_k$ already depends on
-that document.
+different gate for each chunk because its vector $s_{r,k}$ already depends
+on that chunk.
 
-The proposal calls this **entropy-driven adaptive gating**. In the current
-code, this name describes the intended behavior: documents with more useful
-information should justify keeping more capacity. There is no explicit
-Shannon entropy calculation, stochastic gate sampling, or entropy-estimation
-network. The gate learns from relevance, geometric alignment, and sparsity
-losses.
+The gates learn through relevance supervision and the restored sparsity
+penalty, which discourages total gate mass. Coverage uses ungated summaries.
+The keypoint score below uses gated summaries inside cosine similarity;
+positive gate scaling cancels in that cosine, so it does not directly
+encourage gates to stay open. There is no explicit entropy calculation.
 
-Soft gating also does not change the tensor shape. The compressor always
-returns $M$ vectors, and the scorer always evaluates them all. Counts such as
-“number of slots with $\pi>0.5$” are diagnostics. Turning them into a smaller
-stored representation requires a separate hard-pruning implementation.
+Soft gating does not change the tensor shape. The compressor returns $M$
+vectors per chunk, and the scorer evaluates all $J_DM$ document vectors.
+Counts such as “number of slots with $\pi>0.5$” are diagnostics. Turning them
+into a smaller stored representation requires a separate hard-pruning policy.
 
-### 1.5 Late interaction: MaxSim over the bottleneck
+### 1.5 Late interaction and the student relevance probability
 
-The student score is:
+Concatenate chunk summaries along the vector/sequence dimension, preserving
+the embedding width $d$:
 
 $$
-S(Q,D)
+S_D=\operatorname{Concat}(S_1,\ldots,S_{J_D}),
+\qquad
+\pi_D=\operatorname{Concat}(\pi_1,\ldots,\pi_{J_D}).
+$$
+
+Apply the corresponding scalar gate to every summary row:
+
+$$
+B_D
+=\operatorname{diag}(\pi_D)S_D
+=\operatorname{Concat}(B_1,\ldots,B_{J_D})
+\in\mathbb R^{(J_DM)\times d}.
+$$
+
+This is the weighted representation $B_D=\pi_D\odot S_D$, where the
+elementwise product broadcasts each gate across its summary vector's
+$d$ features. It is used for both relevance scoring and keypoint matching.
+
+Keep the MaxSim calculation, with its maximum taken over all document
+summary vectors:
+
+$$
+S_\theta(Q,D)
 = \sum_{i=1}^{L_Q}
-  \max_{1\leq k\leq M}
-  \frac{q_i^\top\widetilde b_k}{\sqrt d}.
+  \max_{\substack{1\leq r\leq J_D\\1\leq k\leq M}}
+  \frac{q_i^\top b_{r,k}}{\sqrt d}.
 $$
 
-The computation has three steps:
+For a single chunk, this is the original maximum over its $M$ slots.
+For multiple chunks, each query slot selects its best match anywhere in the
+document, and those best similarities are summed. Different query slots can
+match different chunks or the same summary slot; matching is not one-to-one.
+The maximum is taken across chunks **before** summing query-slot scores.
+This is not a sum or maximum of independently summed chunk scores.
 
-1. Compute all query-slot/document-slot dot products.
-2. For each query slot, select its largest document-slot similarity.
-3. Sum those best similarities over all query slots.
-
-Different query slots can find evidence in different summary slots. Multiple
-query slots may also select the same summary slot; matching is not one-to-one.
-The operation is asymmetric because every query slot contributes once, while
-document slots contribute only when selected by a maximum.
-
-For a simplified two-query-slot, three-document-slot similarity matrix after
+For a simplified two-query-slot, three-summary-slot similarity matrix after
 scaling and gating:
 
-| Query slot | Document slot 1 | Document slot 2 | Document slot 3 | Selected value |
+| Query slot | Summary slot 1 | Summary slot 2 | Summary slot 3 | Selected value |
 |---|---:|---:|---:|---:|
 | $q_1$ | 0.8 | 0.1 | 0.3 | 0.8 |
 | $q_2$ | 0.2 | 0.9 | 0.4 | 0.9 |
 
-The document score is $0.8+0.9=1.7$. This illustrates how separate pieces of
-query evidence can be matched without collapsing the document into one vector.
+The raw score is $0.8+0.9=1.7$. MaxSim uses raw dot products, so vector
+norms and gate magnitudes matter. The factor $1/\sqrt d$ controls scale,
+but the score remains unbounded.
 
-The score uses **raw dot products**, not cosine similarities. Vector norms and
-gate magnitudes therefore matter. The factor $1/\sqrt d$ controls the numerical
-scale, but does not bound or calibrate student scores as probabilities.
+Introduce two globally shared trainable scalar parameters, a positive scale
+$a$ and a bias $b$, after computing the document score:
+
+$$
+z_\theta(Q,D)=aS_\theta(Q,D)+b,
+\qquad a>0,\quad b\in\mathbb R.
+$$
+
+Enforce positivity by learning an unconstrained scalar $\alpha$ and setting
+$a=\operatorname{softplus}(\alpha)=\log(1+e^\alpha)>0$. Thus $\alpha$ and
+$b$ are the two additional trainable parameters, with $a$ the effective scale.
+
+Apply sigmoid to obtain the student relevance probability:
+
+$$
+p_\theta(Q,D)
+=\sigma(z_\theta(Q,D))
+=\frac{1}{1+\exp[-z_\theta(Q,D)]}.
+$$
+
+For finite logits, sigmoid maps to $(0,1)$. This gives a valid predicted
+probability; statistical calibration must still be evaluated. Because $a$
+is positive and sigmoid is strictly increasing, this transformation preserves
+the ordering of raw MaxSim scores. Neither $a$ nor $b$ is document-specific.
 
 Gating happens before the maximum. Multiplying by a small gate reduces a
-positive similarity, but moves a negative similarity toward zero. Consequently,
-a nearly closed slot can still win if other slot similarities are negative.
-Deleting such a slot is not exactly equivalent to keeping its softly scaled
-vector. Any future hard-pruning policy needs ranking validation.
+positive similarity but moves a negative similarity toward zero. A nearly
+closed slot can therefore still win if other similarities are negative.
+Deleting such a slot can change the score, so hard pruning needs validation.
 
-Despite the proposal's focus on listwise reranking, this scoring function
-returns one independent score per query-document pair. The implemented
-training objective is margin regression plus auxiliary losses; it does not
-contain a listwise softmax, a candidate-list attention mechanism, or a direct
-optimization of a ranking metric.
+The model produces one prediction per query-document pair. These predictions
+can order a candidate list, while the training objective below supervises
+individual pairs rather than a listwise softmax or a ranking metric directly.
 
 ### 1.6 Two teachers provide different kinds of supervision
 
@@ -281,755 +383,692 @@ The design separates generating useful questions from judging relevance.
 **The generative teacher supplies training examples.** Upstream generation
 produces keypoints, direct queries, indirect queries, negative queries, and
 hard negative queries. A keypoint is a factual anchor that associates the
-queries with the same document content. The current repository consumes these
-JSONL files; it does not contain the generative teacher or its generation loop.
-The 70B-class generative model mentioned in the proposal is a design choice,
+queries with document content. The repository consumes these JSONL files;
+it does not contain the generative teacher or its generation loop. The
+70B-class generative model mentioned in the proposal is a design choice,
 not a model instantiated here.
 
-**The discriminative teacher supplies numeric targets.** The implemented
-teacher is `Qwen/Qwen3-Reranker-8B`. The wrapper puts the instruction, query,
+**The discriminative teacher supplies soft probability targets.** The teacher
+is `Qwen/Qwen3-Reranker-8B`. Its wrapper puts the instruction, query,
 and document into a single prompt, runs one causal-LM forward pass, and reads
 the final-position logits for `yes` and `no`:
 
 $$
-T(Q,D)
+p_T(Q,D)
 = \frac{\exp(z_{yes})}{\exp(z_{no})+\exp(z_{yes})}
 = \sigma(z_{yes}-z_{no}).
 $$
 
-This is a two-token relevance probability. The wrapper does not generate an
-answer or use the raw logit difference as its stored score. Calling it a
-probability describes the calculation; the repository does not evaluate its
+This is a two-token relevance probability, used directly as the soft target.
+It is not thresholded into a hard positive or negative label. Calling it a
+probability describes the calculation; the repository does not establish its
 statistical calibration.
 
-Teacher scores are precomputed and saved. During student training, the 8B
-teacher is not loaded and does not receive gradients.
+Teacher targets must describe the same scoring unit as the student
+prediction. For the document score above, obtain one target for $(Q,D)$ and
+apply it after combining the document's chunk summaries. Do not assign that
+document target independently to every chunk: a relevant document can contain
+chunks with no relevant evidence. If a chunk is used as a standalone training
+item, the teacher must judge that same chunk. Obtaining targets for documents
+beyond the teacher's context budget requires a defined long-document teacher
+policy. The implemented teacher rejects inputs beyond its configured context
+budget instead of silently truncating the document.
+
+Teacher probabilities are precomputed and saved. During student training,
+the teacher is frozen, is not loaded into the student training loop, and
+receives no gradients.
+
+#### Main-keypoint JSON supervision
+
+Associate each document with its main keypoint $f_D$. For example, a
+document-linked JSON record can supply:
+
+```json
+{
+  "doc_id": "doc-001",
+  "keypoint": "Borealis uses a 14 nm sensor."
+}
+```
+
+The body for the same `doc_id` supplies the full document $D$. The loader
+accepts this record in a JSON/JSONL sidecar, or an explicit
+`main_keypoint` field on scored training rows. The keypoint text is used
+directly by the keypoint loss, in addition to organizing query supervision.
+
+The theory assumes one designated, nonempty main keypoint per document.
+Several query rows for that document reuse the same main keypoint rather
+than multiplying its loss. The dataset checks the association across the
+entire scored file. Legacy rows with several different keypoints per
+document require an explicit main keypoint; the loader does not silently
+select a row.
 
 ### 1.7 The four training losses
 
-The losses train complementary behavior: imitate relevance margins, retain
-token-level information, align related query formulations, and discourage
-unnecessary gate mass.
+The revised objective combines soft-target binary cross-entropy for relevance,
+coverage within each chunk, matching the document's main keypoint, and
+sparsity over all of a document's gates.
 
-#### A. Margin-MSE: match relative relevance
+#### A. Soft-target binary cross-entropy: match teacher probabilities
 
-The proposal describes comparing a positive and negative document for a fixed
-query. The available dataset instead contains a fixed document with positive
-and negative **queries**. The implemented margin therefore is:
+Let $n$ index the $N$ valid query-document training pairs, with
+$p_{T,n}=p_T(Q_n,D_n)$ and
+$p_{\theta,n}=\sigma(aS_\theta(Q_n,D_n)+b)$. The relevance loss is:
 
 $$
-\begin{aligned}
-\Delta s_{pn}
-  &= S(Q_p^+,D)-S(Q_n^-,D),\\
-\Delta t_{pn}
-  &= T(Q_p^+,D)-T(Q_n^-,D),\\
-\mathcal L_{margin}
-  &= \frac{\sum_{r,p,n} a_{rpn}
-       (\Delta s_{rpn}-\Delta t_{rpn})^2}
-      {\max(1,\sum_{r,p,n}a_{rpn})}.
-\end{aligned}
+\mathcal L_{\mathrm{BCE}}
+= -\frac{1}{N}\sum_{n=1}^{N}
+  \left[
+  p_{T,n}\log p_{\theta,n}
+  +(1-p_{T,n})\log(1-p_{\theta,n})
+  \right].
 $$
 
-Here $r$ indexes training rows, $p$ indexes the two positive queries
-(direct and indirect), $n$ indexes the combined negative and hard negative
-queries, and $a$ masks nonexistent query slots.
+Direct, indirect, ordinary negative, and hard negative queries each contribute
+their own pair loss against the corresponding document and teacher target.
+For example, a row with two positive queries, two negatives, and two hard
+negatives contributes six valid BCE terms. A teacher target of $0.9$ asks
+the student to predict $0.9$, while a target of $0.2$ asks it to predict
+$0.2$. Direct and indirect predictions can differ when their teacher targets
+differ.
 
-For example, teacher scores of 0.9 for a positive query and 0.2 for a negative
-query yield a target margin of 0.7. Student scores of 2.0 and 1.3 satisfy the
-target just as well as 0.8 and 0.1. The objective fits the difference, not the
-two absolute scores. Teacher margins lie in $[-1,1]$ because they are
-differences of probabilities.
+For numerical stability, evaluate BCE directly from the logits, using
+$-\left[p_T\log\sigma(z)+(1-p_T)\log(1-\sigma(z))\right]
+=\operatorname{softplus}(z)-p_Tz$. With a validity mask $m_n$ for padded
+query entries, the batched form is:
 
-Every valid positive-negative combination contributes. With two positives,
-two ordinary negatives, and two hard negatives, one row contributes eight
-margin pairs. Hard negatives are included through the same formula and have
-no separate coefficient.
+$$
+\mathcal L_{\mathrm{BCE}}
+= \frac{\sum_n m_n
+  \left[\operatorname{softplus}(z_{\theta,n})-p_{T,n}z_{\theta,n}\right]}
+  {\max(1,\sum_n m_n)}.
+$$
 
-This adaptation matters for interpreting the result. It directly teaches
-which queries match a document better. It does not directly compare different
-documents for one query. Adding the same offset to every score against one
-document leaves these margin targets unchanged, so these targets alone do
-not determine cross-document score offsets.
+Use a numerically stable BCE-with-logits operation on $z_{\theta,n}$, with
+the teacher probability as its target. Sigmoid defines the predicted
+probability; do not apply it again before a BCE-with-logits operation.
+Missing query entries contribute neither loss nor count.
 
-#### B. IDF-weighted Chamfer: preserve coverage and grounding
+#### B. Coverage loss: preserve weighted token coverage within each chunk
 
 Relevance supervision observes only the questions present in the training
-data. The Chamfer objective adds a geometric comparison between the full
-document token set $H_D$ and the summary set $B_D$.
+data. Coverage compares a chunk's contextualized tokens $H_r$ with **that
+same chunk's** ungated summaries $S_r$. Coverage remains local to each
+chunk. The keypoint loss below instead matches against summaries from all
+chunks of the associated document.
 
-Define a cosine distance:
-
-$$
-c_{jk}=1-\frac{h_j^\top b_k}{\lVert h_j\rVert\lVert b_k\rVert}.
-$$
-
-The code computes normalized vectors in float32, with a small norm epsilon
-for numerical stability. Document padding is excluded from the objective.
-
-**Coverage asks whether every real document token has a nearby summary.**
+Define cosine distance for real token positions $j=1,\ldots,\ell_r$ and
+summary slots $k=1,\ldots,M$:
 
 $$
-\mathcal L_{coverage}(D)
-= \frac{1}{L_D}
-  \sum_{j=1}^{L_D}\operatorname{IDF}(t_j)\min_k c_{jk}.
+c_{r,jk}
+=1-\frac{h_{r,j}^\top s_{r,k}}
+        {\lVert h_{r,j}\rVert\lVert s_{r,k}\rVert}.
 $$
 
-A rare token receives a larger weight, so losing the direction of a rare
-name or technical identifier is intended to cost more than losing a common
-token. Each token position contributes separately, including repeated token
-IDs. The denominator is the number of real tokens, not the sum of IDF weights.
+Normalize vectors in float32 with a small norm epsilon for numerical
+stability. Exclude padded token positions from coverage.
 
-The repository computes subword-token IDF as:
+Use the revised nonnegative IDF weight for each real token:
 
 $$
-\operatorname{IDF}(t)
-= \log\frac{N_{corpus}}{1+\operatorname{df}(t)},
+w_{r,j}
+= \log\frac{N_{\mathrm{corpus}}+1}
+              {\operatorname{df}(t_{r,j})+1}
+\geq 0.
 $$
 
-where document frequency counts documents containing a token at least once.
-Unseen token IDs receive $\log(\max(N_{corpus},1))$. The formula is used as
-written, without clipping: a token appearing in every document has a small
-negative IDF, $\log(N_{corpus}/(N_{corpus}+1))$. Thus coverage is not strictly
-a nonnegative divergence under every possible corpus statistic.
+Here $N_{\mathrm{corpus}}$ is the number of original corpus documents, and
+$\operatorname{df}(t)$ counts documents containing token $t$ at least once.
+Splitting documents into chunks does not change the unit of document
+frequency. For $0\leq\operatorname{df}(t)\leq N_{\mathrm{corpus}}$, these
+weights are nonnegative. A token present in every document receives zero
+weight; an unseen token receives $\log(N_{\mathrm{corpus}}+1)$.
 
-**Precision asks whether each important summary is grounded in a real token.**
-
-$$
-\mathcal L_{precision}(D)
-= \frac{\sum_{k=1}^{M}\pi_k\min_j c_{jk}}
-        {\max(\epsilon,\sum_{k=1}^{M}\pi_k)}.
-$$
-
-A high-gate summary that is far from every real document token is penalized.
-This discourages spending summary capacity on directions unrelated to the
-document. Coverage and precision use opposite nearest-neighbor directions;
-there is no one-to-one assignment between tokens and slots.
-
-The complete geometric loss averages over the unique documents in a batch:
+Let $W_r=\sum_{j=1}^{\ell_r}w_{r,j}$. For a chunk with $W_r>0$, define:
 
 $$
-\mathcal L_{Chamfer}
-= \operatorname{mean}_D
-  \left[\mathcal L_{coverage}(D)
-        +\beta\mathcal L_{precision}(D)\right].
+\mathcal L_{\mathrm{coverage}}(C_r)
+= \frac{\sum_{j=1}^{\ell_r}
+          w_{r,j}\min_{1\leq k\leq M}c_{r,jk}}
+        {\sum_{j=1}^{\ell_r}w_{r,j}}.
 $$
 
-Three qualifications are important for understanding this objective:
+This is a weighted average of nearest-summary cosine distances, normalized
+by total token weight rather than token count. Rare tokens receive greater
+relative importance. Repeated token positions contribute separately,
+including their weights in the denominator. Padding contributes neither
+distance nor weight.
 
-1. **Cosine alignment does not enforce magnitude alignment.** MaxSim uses
-   raw dot products, so two representations with similar cosine directions
-   can still produce different relevance scores because their norms differ.
-2. **Both sides are trainable.** The loss does not detach $H_D$. The backbone
-   and compressor can both move during optimization; $H_D$ is not a frozen
-   lexical reconstruction target. Low geometric loss alone does not prove
-   exact fact preservation.
-3. **Coverage does not directly require an open gate.** For a positive scalar
-   $\pi_k$, $\cos(h_j,\pi_k b_k)=\cos(h_j,b_k)$ when norms are nonzero and
-   above the normalization epsilon. The implementation therefore compares
-   pre-gate $B_D$ to $H_D$, avoiding near-zero gated norms. Coverage has no
-   direct gate factor. Gates enter the precision term as its explicit
-   normalized weights, and enter relevance scoring through
-   $\widetilde B_D$.
+If $W_r=0$, define $\mathcal L_{\mathrm{coverage}}(C_r)=0$ and use a safe
+denominator when evaluating the formula so no division by zero occurs.
+Such a chunk contributes no coverage gradient; keypoint matching, relevance,
+and sparsity still apply. For positive $W_r$, use the exact total weight as
+the denominator.
 
-In particular, a uniformly smaller gate vector leaves the normalized
-precision ratio approximately unchanged while the denominator remains above
-epsilon. The geometric loss by itself is not a guarantee that every
-token-covering slot will survive a future hard-pruning threshold.
-
-#### C. Consistency: align direct and indirect query scores
-
-For two queries attached to the same document and keypoint:
+Let $\mathcal U$ be the set of unique chunks belonging to documents in the
+batch. The standalone batch coverage loss is:
 
 $$
-\mathcal L_{consistency}
-= \operatorname{mean}_r
-  \left(S(Q_{direct,r},D_r)-S(Q_{indirect,r},D_r)\right)^2.
+\mathcal L_{\mathrm{coverage}}
+= \frac{1}{|\mathcal U|}
+  \sum_{C_r\in\mathcal U}\mathcal L_{\mathrm{coverage}}(C_r).
 $$
 
-This encourages similar relevance for two ways of asking about the same
-factual anchor. It compares **scalar scores**, not query embeddings or
-attention maps. It therefore does not require the two queries to use the
-same bottleneck slots.
+Chunks with zero total token weight contribute zero to this average and
+remain included in its chunk count.
 
-Teacher scores for direct and indirect queries may differ. The consistency
-term can then compete with margin fitting; its coefficient controls how
-strongly equal scoring is preferred.
+#### C. Keypoint loss: preserve the document's main factual content
 
-#### D. Sparsity: penalize total gate mass
-
-The implemented sparsity term is:
+Tokenize the whole main keypoint $f_D$ and pass all of its real tokens
+through the same full encoder used to contextualize document chunks:
 
 $$
-\mathcal L_{sparsity}
-= \operatorname{mean}_D\sum_{k=1}^{M}\pi_k.
+U_f=E_D(f_D)=[u_1,\ldots,u_{L_f}]
+\in\mathbb R^{L_f\times d}.
 $$
 
-Since gates are nonnegative, this is an $L_1$ penalty on the gate values. It
-encourages lower gate mass when other objectives do not justify a larger
-value. The sum can be interpreted as an effective soft capacity. It would
-equal the expected active count under hypothetical independent Bernoulli
-retention, but the implementation does not actually sample such gates.
+This shares the backbone and input embedding table with the document path.
+It produces one contextualized vector per keypoint token, without pooling,
+summary compression, or the query adapter's fixed 32-slot truncation. The
+keypoint encoder is trainable and shares parameters with the document
+encoder; its outputs are not detached targets or a separate frozen teacher.
+Since both sides have width $d$, the reference projection $P_\phi$ is the
+identity.
 
-This penalty is not binary entropy and does not impose a fixed number of
-active slots. The hoped-for relationship between information density and
-gate counts is an empirical property to inspect after training. Also,
-because scoring uses unnormalized vectors, changing vector norms can partly
-compensate for gate scaling; gate mass is not a direct measure of stored
-information or realized computation.
-
-### 1.8 Joint optimization and the role of each term
-
-The total objective is:
+Match each real keypoint token against the **gated** document summary set
+$B_D=\operatorname{diag}(\pi_D)S_D$:
 
 $$
-\mathcal L_{total}
-= \mathcal L_{margin}
- +\lambda_{Chamfer}\mathcal L_{Chamfer}
- +\lambda_{consistency}\mathcal L_{consistency}
- +\lambda_{sparsity}\mathcal L_{sparsity}.
+g(S_D,f_D)
+=\frac{1}{L_f}\sum_{i=1}^{L_f}
+  \max_{\substack{1\leq r\leq J_D\\1\leq k\leq M}}
+  \cos(u_i,b_{r,k}),
+\qquad b_{r,k}=\pi_{r,k}s_{r,k}.
 $$
 
-The checked-in configuration sets:
+The notation $g(S_D,f_D)$ includes the gates through $B_D$. This is the
+mean of each keypoint token's best cosine match across all real document
+chunks. The keypoint tokens have equal weight; the coverage IDF weights
+are not applied here. Multiple tokens may select the same summary slot,
+and different tokens may match different chunks.
+
+Define the loss for that keypoint as requested:
+
+$$
+\mathcal L_{\mathrm{keypoint}}(D,f_D)=1-g(S_D,f_D).
+$$
+
+For exact cosine similarity on nonzero vectors, $g\in[-1,1]$ and this loss
+lies in $[0,2]$. It is a matching objective, not a relevance probability.
+
+Exclude keypoint padding from encoder attention and the token average.
+Exclude padded or nonexistent document chunks from the maximum; zero-filled
+batch padding must not act as candidate summaries. Require a nonempty main
+keypoint, so $L_f>0$. For numerical stability, implement cosine in float32
+with epsilon-safe normalization:
+
+$$
+\cos_\epsilon(x,y)
+=\left(\frac{x}{\max(\lVert x\rVert,\epsilon)}\right)^\top
+ \left(\frac{y}{\max(\lVert y\rVert,\epsilon)}\right).
+$$
+
+This gives zero similarity for an exactly zero vector. It is a numerical
+safeguard; padded candidates are still explicitly excluded.
+
+Let $\mathcal D_B$ be the set of unique documents in the batch, each with
+its designated main keypoint. Average the keypoint loss once per document:
+
+$$
+\mathcal L_{\mathrm{keypoint}}
+=\frac{1}{|\mathcal D_B|}
+  \sum_{D\in\mathcal D_B}
+  \mathcal L_{\mathrm{keypoint}}(D,f_D).
+$$
+
+Query rows that share a document do not repeat its keypoint loss.
+
+**Positive gate scaling cancels inside cosine.** For nonzero keypoint and
+summary vectors and $\pi_{r,k}>0$:
+
+$$
+\cos(u_i,\pi_{r,k}s_{r,k})=\cos(u_i,s_{r,k}).
+$$
+
+Consequently, the requested keypoint loss aligns summary directions but has
+no direct gradient on the gate scalar in this regime. Epsilon normalization
+can break the cancellation when gated norms approach the epsilon floor;
+that numerical effect is not reliable supervision for retention. The loss
+does not ensure that keypoint-matching slots survive sparsity or hard pruning.
+
+#### D. Sparsity loss: penalize total document gate mass
+
+Restore the sum-of-gates penalty, averaged over unique documents:
+
+$$
+\mathcal L_{\mathrm{sparsity}}
+=\frac{1}{|\mathcal D_B|}
+  \sum_{D\in\mathcal D_B}
+  \sum_{r=1}^{J_D}\sum_{k=1}^{M}\pi_{D,r,k}.
+$$
+
+The additional $D$ index makes the document association explicit. Every real
+chunk and summary slot contributes; batching padding does not. This is an
+$L_1$ penalty on nonnegative gate values, rather than binary entropy. Longer
+documents contribute more terms because they have more chunks; the penalty
+is a document-level sum, not a per-slot mean.
+
+Sparsity encourages smaller total gate mass, while relevance supervision
+can favor retaining useful weighted summaries. The coverage loss and, away
+from the numerical epsilon floor, the cosine keypoint loss do not directly
+oppose shrinking gates. Raw dot-product relevance also depends on summary
+norms, so changing vector norms can partly compensate for gate scaling.
+Lower gate mass is therefore neither a guarantee of a particular active
+slot count nor a physical reduction in stored vectors. That reduction still
+requires a separate pruning policy.
+
+Coverage and keypoint matching both use cosine directions, which do not
+enforce the vector magnitudes used by relevance MaxSim. The document and
+keypoint encoder share trainable parameters, so their representations can
+move together. Low alignment losses alone do not establish exact fact
+preservation.
+
+### 1.8 Joint optimization
+
+The complete revised objective has four components:
+
+$$
+\boxed{
+\mathcal L_{\mathrm{total}}
+= \mathcal L_{\mathrm{BCE}}
+ +\lambda_{\mathrm{coverage}}\mathcal L_{\mathrm{coverage}}
+ +\lambda_{\mathrm{keypoint}}\mathcal L_{\mathrm{keypoint}}
+ +\lambda_{\mathrm{sparsity}}\mathcal L_{\mathrm{sparsity}}.
+}
+$$
+
+Precision is replaced by keypoint matching. Sparsity is restored.
+Margin-MSE and consistency loss remain excluded. Each auxiliary loss has
+its own nonnegative coefficient.
+
+Example starting weights for the revised theory are:
 
 | Parameter | Value | Effect |
 |---|---:|---|
-| $\lambda_{Chamfer}$ | 1.0 | Strength of geometric coverage and grounding |
-| $\lambda_{consistency}$ | 0.5 | Strength of direct/indirect score agreement |
-| $\lambda_{sparsity}$ | 0.01 | Cost of total gate mass |
-| $\beta$ | 1.0 | Precision weight within Chamfer |
+| $\lambda_{\mathrm{coverage}}$ | 1.0 | Strength of token coverage within each chunk |
+| $\lambda_{\mathrm{keypoint}}$ | 1.0 | Strength of matching the document's main keypoint |
+| $\lambda_{\mathrm{sparsity}}$ | 0.01 | Cost of summed gate mass across a document's chunks |
 
-The scales of the losses differ. Sparsity is a sum over 256 slots per
-document, whereas margin-MSE averages over valid query pairs. Coefficients
-should therefore be interpreted together with the logged component values.
+The shared embedding table and document/keypoint backbone, query adapter,
+initial summary queries, cross-attention and self-attention layers, both
+FFNs per summary block, normalization layers, gating head, and score
+parameters $\alpha,b$ are optimized jointly. The keypoint branch introduces
+no independent encoder parameters. Teacher probabilities, keypoint text, and
+corpus-derived token weights remain fixed; keypoint token vectors are
+recomputed through the shared trainable encoder.
 
-The shared embedding table, document backbone, query adapter, summary queries,
-cross-attention blocks, and gating head are optimized jointly. Chamfer and
-sparsity are averaged over unique documents; margin and consistency are based
-on keypoint rows. If several rows share a document, they add query supervision
-without repeating that document's geometric penalty within the same batch.
+BCE averages over valid query-document examples. Coverage averages over
+unique chunks, while keypoint loss and sparsity each average over unique
+documents. Repeated query rows add relevance supervision without repeating
+the document's auxiliary penalties in the batch. The four losses can have
+different scales; interpret their coefficients alongside separately logged
+component values.
 
 ### 1.9 What compression saves, and what remains expensive
 
-Let a conventional multi-vector representation retain $L_D$ document vectors.
-Its representation storage is proportional to $L_Dd$. This bottleneck instead
-stores $Md$ vector elements, independent of document length once encoded.
+A conventional token-level representation stores $N_Dd$ vector elements for
+a document. Chunk compression stores $J_DMd$ elements. Its vector-count
+reduction factor is:
 
-For a 768-token document and the default $M=256$, the vector-count reduction
-is $768/256=3$. For a document shorter than 256 tokens, a dense 256-slot
-representation can actually contain more vectors than the token-level
-representation. The current model provides a fixed upper budget, not a
-guaranteed reduction for every input.
+$$
+\frac{N_D}{J_DM}.
+$$
 
-At $M=256$ and $d=1024$, the vector payload alone would occupy:
+A full 1,024-token chunk compressed to $M=32$ slots has a $32\times$
+vector-count reduction. For a 2,500-token document, the chunks contain
+1,024, 1,024, and 452 real tokens, producing $3\times32=96$ summary
+vectors, for a reduction of $2500/96\approx26.04\times$.
+The short final chunk still receives $M$ slots. A document shorter than
+$M$ tokens can therefore have more summary vectors than token vectors.
+The design fixes capacity per chunk rather than guaranteeing a reduction
+for every input.
 
-- 524,288 bytes, or 0.5 MiB, if stored with two-byte elements;
-- 1,048,576 bytes, or 1 MiB, if stored with four-byte elements.
+At $M=32$ and $d=1024$, the dense vector payload per chunk occupies:
 
-These figures exclude model weights, IDs, gate metadata, indexing overhead,
-and temporary tensors. They describe possible representation storage; no
-compressed-index storage format is implemented, and bf16 training does not
-automatically define an inference storage dtype.
+- 65,536 bytes, or 64 KiB, with two-byte elements;
+- 131,072 bytes, or 128 KiB, with four-byte elements.
 
-MaxSim performs $L_QM=32\times256=8,192$ vector dot products per document,
-each of width 1024. Its arithmetic cost is $O(L_QMd)$, approximately 8.39
-million scalar multiply-accumulates for the dot products at these defaults.
-“8,192 interactions” does not mean 8,192 scalar operations.
+Multiply by $J_D$ for the whole document. These figures exclude model
+weights, IDs, gate metadata, indexing overhead, and temporary tensors.
+Training in bf16 does not automatically define an inference storage dtype.
 
-Document encoding remains the expensive part: the full Transformer runs
-before compression, and the cross-attention interaction itself costs
-$O(ML_Dd)$ in addition to projections and feed-forward layers. The backbone
-also retains its self-attention and feed-forward costs. Training must keep
-uncompressed hidden states and compute the $L_D\times M$ Chamfer matrix.
+MaxSim evaluates $L_QJ_DM$ vector dot products per document, each of width
+$d$, giving arithmetic cost $O(L_QJ_DMd)$. With $L_Q=32$ and $M=32$,
+that is 1,024 dot products per chunk, or approximately 1.05 million scalar
+multiply-accumulates at width 1024. The whole-document cost grows with its
+chunk count.
 
-The intended serving advantage comes from compressing documents in advance
-and encoding a query once for many candidates. The current repository exposes
-the necessary encoders and scorer, but does not implement that serving
-pipeline, hard pruning, quantization, NPU export, or latency benchmarks. A
-bounded interaction size alone does not establish sub-millisecond latency.
+Document encoding remains the expensive part: the full backbone runs
+independently on every chunk before compression. Each summary block adds
+cross-attention interactions costing $O(MCd)$ and summary self-attention
+interactions costing $O(M^2d)$ per chunk, in addition to projections and
+FFNs. Across $L$ blocks and $J_D$ chunks, those interaction costs are
+$O(LJ_D(MC+M^2)d)$. Training also retains uncompressed chunk states and
+computes an $\ell_r\times M$ cosine-distance matrix per chunk for coverage.
+Keypoint supervision adds a full encoder pass for each main keypoint and
+an $L_f\times(J_DM)$ cosine-similarity matrix for its document. These
+keypoint computations are needed during training; serving query-document
+scores does not require the keypoint branch.
+
+The intended serving advantage comes from compressing chunks in advance
+and encoding a query once for many candidate documents. Chunking bounds
+each compression input, while total storage and scoring still grow with
+document length. Neither the fixed per-chunk budget nor these operation
+counts establish a deployment latency.
 
 ## Part 2: Implementation
 
+The code implements the four-loss objective in Part 1. Configuration and
+saved data from the earlier margin/Chamfer model need migration before a
+new training run.
+
 ### 2.1 Repository structure and responsibilities
 
-```text
-reranking/
-├── README.md
-├── configs/
-│   └── default.yaml
-├── docs/
-│   ├── proposal.tex
-│   └── compression.md
-├── scripts/
-│   ├── run_build_index.sh
-│   ├── run_build_idf.sh
-│   ├── run_precompute_teacher.sh
-│   └── run_train.sh
-└── src/
-    ├── __init__.py
-    ├── config.py
-    ├── losses.py
-    ├── train.py
-    ├── data/
-    │   ├── __init__.py
-    │   ├── build_index.py
-    │   ├── idf.py
-    │   └── dataset.py
-    ├── distill/
-    │   ├── __init__.py
-    │   ├── teacher_qwen_reranker.py
-    │   └── precompute_teacher_scores.py
-    ├── model/
-    │   ├── __init__.py
-    │   ├── bidirectional.py
-    │   ├── document_compressor.py
-    │   ├── query_adapter.py
-    │   └── reranker.py
-    └── eval/
-        ├── __init__.py
-        ├── inspect_bottleneck.py
-        └── sample_beir_compress.py
-```
-
-The tree shows source and documentation, omitting Python cache files. Runtime
-directories such as `data/` and `runs/default/` are created by pipeline stages
-and are not present in the inspected working tree.
-
-| Theory component | Implementation entry point |
+| Component | Implementation |
 |---|---|
-| Configuration and YAML overrides | [`Config.from_yaml`](../src/config.py) |
-| Join upstream supervision into training rows | [`build_unified_examples`](../src/data/build_index.py) |
-| Corpus token IDF | [`build_idf_table`](../src/data/idf.py) |
-| Teacher probabilities | [`QwenRerankerTeacher.score_batch`](../src/distill/teacher_qwen_reranker.py) |
-| Save teacher-scored examples | [`_score_chunk` and `main`](../src/distill/precompute_teacher_scores.py) |
-| Lazy training data and query/document tokenization | [`ScoredExamplesDataset` and `Collator`](../src/data/dataset.py) |
-| Padding-only document attention | [`make_bidirectional`](../src/model/bidirectional.py) |
-| Query adapter | [`ResidualQueryAdapter`](../src/model/query_adapter.py) |
-| Summary extraction and gates | [`DocumentCompressor` and `CrossAttnBlock`](../src/model/document_compressor.py) |
-| Shared model and MaxSim | [`LatentBottleneckReranker`](../src/model/reranker.py) |
-| Four losses and weighted combination | [`src/losses.py`](../src/losses.py) |
-| Batch forward pass and optimization | [`forward_batch_and_loss` and `main`](../src/train.py) |
-| Gate and representation inspection | [`src/eval/inspect_bottleneck.py`](../src/eval/inspect_bottleneck.py) |
-| Out-of-domain compressor diagnostics | [`src/eval/sample_beir_compress.py`](../src/eval/sample_beir_compress.py) |
+| Model, data, loss, teacher, and training configuration | [src/config.py](../src/config.py), [configs/default.yaml](../configs/default.yaml) |
+| Join upstream document, query, and negative-query files | [src/data/build_index.py](../src/data/build_index.py) |
+| Full-document corpus frequencies and coverage weights | [src/data/idf.py](../src/data/idf.py) |
+| Lazy scored rows, main-keypoint resolution, and chunk batching | [src/data/dataset.py](../src/data/dataset.py) |
+| Full-document teacher targets and resumable precomputation | [teacher wrapper](../src/distill/teacher_qwen_reranker.py), [precomputation](../src/distill/precompute_teacher_scores.py) |
+| Padding-only backbone attention | [src/model/bidirectional.py](../src/model/bidirectional.py) |
+| Shallow query encoder | [src/model/query_adapter.py](../src/model/query_adapter.py) |
+| Cross-attention, FFN1, self-attention, FFN2, and gating | [src/model/document_compressor.py](../src/model/document_compressor.py) |
+| Chunk aggregation, shared keypoint encoder, MaxSim, and probability | [src/model/reranker.py](../src/model/reranker.py) |
+| BCE, coverage, keypoint matching, and sparsity | [src/losses.py](../src/losses.py) |
+| Batch forward, optimization, metrics, and checkpoints | [src/train.py](../src/train.py) |
+| Gate and representation inspection | [inspect_bottleneck.py](../src/eval/inspect_bottleneck.py), [sample_beir_compress.py](../src/eval/sample_beir_compress.py) |
 
-### 2.2 Configuration: what controls each stage
+### 2.2 Configuration
 
-[`src/config.py`](../src/config.py) defines five dataclasses: `ModelConfig`,
-`TeacherConfig`, `DataConfig`, `LossConfig`, and `TrainConfig`, collected in
-`Config`. `Config.from_yaml(path)` starts from the Python defaults and
-replaces fields present in each YAML section. Passing no path uses only the
-dataclass defaults.
+The checked-in YAML uses the following settings:
 
-The checked-in [default YAML](../configs/default.yaml) specifies:
-
-| Section | Important settings |
+| Setting | Value or behavior |
 |---|---|
-| `model` | Backbone `Qwen/Qwen3-0.6B`; width 1024; 256 summary slots; query length 32; two query layers; one cross-attention layer; eight heads for both adapters; document length 768; mask token `<\|vision_pad\|>` |
-| `teacher` | `Qwen/Qwen3-Reranker-8B`; maximum length 1024; bf16; batch size 16 |
-| `data` | Upstream source directories; unified JSONL, scored JSONL, and IDF paths; two negatives and two hard negatives per keypoint |
-| `loss` | Chamfer 1.0; consistency 0.5; sparsity 0.01; Chamfer precision factor 1.0 |
-| `train` | AdamW learning rate `2e-5`; weight decay 0.01; batch size 8; accumulation 4; five epochs; warmup ratio 0.05; bf16 enabled |
-| `train` continued | Output `runs/default`; console logging every 20 optimizer steps; checkpoint every 1000; seed 42; two data workers; gradient norm limit 1.0 |
+| Backbone and width | `Qwen/Qwen3-Embedding-0.6B`, 1024 dimensions |
+| Chunk size | `model.doc_chunk_size: 1024`; no whole-document prefix limit |
+| Summary capacity | 32 slots per chunk; one refinement block; eight attention heads |
+| Query adapter | 32 slots, two layers, eight heads, fill token `<\|vision_pad\|>` |
+| Teacher budget | 32,768 tokens for the entire formatted input, including query and prompt |
+| Main-keypoint source | `data.main_keypoints_path` sidecar, or explicit scored-row fields |
+| Loss weights | Coverage 1.0, keypoint 1.0, sparsity 0.01; BCE coefficient 1 |
+| Optimizer | AdamW, learning rate `2e-5`, weight decay 0.01 |
+| Training | Batch size 8 query rows, four accumulation steps, five epochs, bf16 |
 
-The distinction between YAML values and actual CLI configuration matters:
+`Config.from_yaml` starts with dataclass defaults and replaces specified
+fields. The Python epoch default is three; the YAML overrides it to five.
+The former `doc_max_len`, `lambda_chamfer`, `lambda_consistency`,
+and `chamfer_beta` fields are removed. Update old YAML files.
 
-- `src.train` reads the YAML. Its CLI can override `--scored-path`,
-  `--idf-path`, and `--output-dir`.
-- The data-building, IDF, and teacher-precomputation CLIs use their own
-  arguments. They do **not** load the YAML. The shell wrappers pass explicit
-  arguments to those CLIs.
-- In particular, `run_precompute_teacher.sh` uses a score batch size of 32
-  and leaves maximum length at the precomputation CLI default of 4096. The
-  YAML's teacher batch size 16 and maximum length 1024 do not change that
-  invocation. Set `--score-batch-size` and `--max-length` explicitly to
-  change it.
-- Negative-list limits are applied during teacher precomputation. Training
-  consumes the lists already stored in the scored file; it does not trim
-  them again according to `cfg.data.neg_per_keypoint` or
-  `cfg.data.hardneg_per_keypoint`.
-- Without `--config`, Python defaults differ in several places: student
-  document length is 512, teacher length is 4096, and training is three
-  epochs. The training wrapper explicitly selects `configs/default.yaml`.
+The data-building, IDF, and teacher-precomputation CLIs use their own
+arguments. Use teacher precomputation's `--max-length` to change its budget;
+editing a training YAML does not configure that separate CLI.
 
-The configured width must match the loaded backbone's output width, and the
-head counts must be compatible with that width. Changing only the model name
-does not automatically derive a new `hidden_size` or make the attention-mask
-patch compatible with a different architecture.
+### 2.3 Training rows and main-keypoint JSON
 
-### 2.3 Build the training examples
-
-[`src/data/build_index.py`](../src/data/build_index.py) reads three source
-patterns from two directories:
-
-| Pattern | Fields used by this repository |
-|---|---|
-| `full_run/keypoints_part*.jsonl` | `doc_id`, `body` |
-| `full_run/keypoint_queries_part*.jsonl` | `doc_id`, keypoint text, queries labeled `direct` or `indirect` |
-| `negative_query/negative_queries_part*.jsonl` | `doc_id`, keypoint text, `negative_queries`, `hard_negative_queries` |
-
-The files are not assumed to be line-aligned. `_load_jsonl_by_doc_id` loads
-each source group into a dictionary keyed by `doc_id`; a repeated ID replaces
-the earlier record. The builder takes the intersection of IDs present in all
-three source groups, then joins the positive and negative entries within a
-document by the **exact keypoint string**.
-
-A row is emitted only if it has a nonempty canonical body, both a direct and
-an indirect query, a matching negative-source keypoint, and at least one
-negative query of either kind. Missing keypoint matches are counted. There is
-no fuzzy keypoint matching or semantic alignment step.
-
-The resulting unit is one `(doc_id, keypoint)` row, for example:
+Training consumes teacher-scored JSONL. A minimal row has the following
+shape; values are illustrative:
 
 ```json
 {
-  "doc_id": "example-001",
-  "keypoint": "Borealis uses a 14 nm sensor.",
-  "body": "The Aurora instrument launched in 2019. Its successor, Borealis, launched three years later and uses a 14 nm sensor.",
+  "doc_id": "doc-001",
+  "body": "Borealis uses a 14 nm sensor.",
+  "main_keypoint": "Borealis uses a 14 nm sensor.",
   "direct_query": "What sensor process does Borealis use?",
   "indirect_query": "What sensor process does Aurora's successor use?",
-  "negative_queries": ["How deep is the Pacific Ocean?"],
-  "hard_negative_queries": ["Does Borealis use a 7 nm sensor?"]
-}
-```
-
-This is an illustrative schema, not an excerpt from the corpus. Negative
-queries are supplied upstream; the joiner does not validate their meaning.
-Several keypoint rows can repeat the same document body. `keypoint` determines
-which queries belong together, but is not separately fed to the student or
-teacher. Student training uses `body` as document text, without adding title
-or URL fields.
-
-Output rows are streamed to `data/unified_examples.jsonl`, but the three
-source dictionaries are loaded into memory before the join. Thus the join is
-not fully streaming with respect to raw corpus memory. Its `--limit` caps
-records read across each source group, rather than guaranteeing that many
-joined documents or output rows.
-
-### 2.4 Build token-level IDF statistics
-
-[`src/data/idf.py`](../src/data/idf.py) scans nonempty bodies from
-`keypoints_part*.jsonl`, independently of which documents survive the training
-join. It uses the student tokenizer, takes up to 4096 tokens per body, and
-converts each tokenized document into a set. A token occurring ten times in
-one document therefore increments its document frequency only once.
-
-Processing can run sequentially or through `ProcessPoolExecutor`. Each worker
-initializes its own tokenizer. The final table has `len(tokenizer)` entries
-and stores the IDF formula described in Part 1.
-
-The saved `data/idf_table.pt` object is a dictionary:
-
-```python
-{
-    "idf": idf_tensor,       # float32, shape (vocabulary_size,)
-    "n_docs": document_count,
-    "tokenizer": tokenizer_name,
-}
-```
-
-Training loads `idf_blob["idf"]` and indexes it directly with student token
-IDs. The table must therefore correspond to the student's tokenizer. The
-current training loader does not verify the stored tokenizer metadata. Note
-also that IDF statistics use a 4096-token prefix, while the YAML-configured
-student training window is 768 tokens.
-
-### 2.5 Precompute discriminative teacher scores
-
-[`teacher_qwen_reranker.py`](../src/distill/teacher_qwen_reranker.py) loads
-the teacher through `AutoModelForCausalLM`, moves it to the requested device,
-and sets evaluation mode. The teacher retains causal attention; the student's
-bidirectional patch is not applied to it.
-
-The wrapper formats each pair as:
-
-```text
-<Instruct>: Given a web search query, retrieve relevant passages that answer the query
-<Query>: {query}
-<Document>: {document}
-```
-
-This text is placed between a system/user prefix requesting a `yes`/`no`
-judgment and an assistant suffix containing an empty thinking block.
-`_process_inputs` reserves space for that prefix and suffix before truncating
-the pair text. Left padding makes the last position the end of each real
-prompt. `score_batch` requests the final-position logits with
-`logits_to_keep=1`, selects the two label logits, and returns their two-class
-softmax probability for `yes`. Scoring runs under `torch.no_grad()`.
-
-[`precompute_teacher_scores.py`](../src/distill/precompute_teacher_scores.py)
-then performs the following work:
-
-1. Read unified rows in chunks, with a default chunk size of 256 records.
-2. Keep the first two negative and first two hard negative queries by
-   default. This is deterministic prefix selection, not random sampling.
-3. Flatten all direct, indirect, negative, and hard negative pairs in the
-   chunk into one list. Each pair uses the row's same document body.
-4. Score that list in batches, defaulting to 32 pairs per batch.
-5. Restore each score to its source row and append complete JSON lines to
-   `data/unified_examples.scored.jsonl`.
-
-The scored row retains the query text and adds:
-
-```json
-{
+  "negative_queries": ["What material is Borealis's housing made from?"],
+  "hard_negative_queries": ["Does Borealis use a 7 nm sensor?"],
   "teacher_scores": {
     "direct": 0.94,
     "indirect": 0.89,
     "negative_queries": [0.02],
     "hard_negative_queries": [0.18]
+  },
+  "teacher_metadata": {
+    "teacher_name": "Qwen/Qwen3-Reranker-8B",
+    "instruction": "Given a web search query, retrieve relevant passages that answer the query",
+    "max_length": 32768,
+    "document_scope": "full_document"
   }
 }
 ```
 
-These numbers are illustrative. Score arrays must have the same lengths and
-ordering as their corresponding query arrays.
+Negative query lists may be empty. Their teacher arrays must match their
+lengths and ordering. Every actual target must be a finite probability in
+$[0,1]$. Queries, document bodies, and main keypoints must be nonempty.
 
-Resume is based on the existing output line count: the script skips that
-many input lines and appends more output. It assumes that the source order,
-teacher settings, and negative limits have not changed and that existing
-lines are complete. It does not compare IDs, record a configuration manifest,
-or repair a partially written final line. `--overwrite` starts the scored
-output again. The current `--limit` accounting advances when a chunk is
-written, so it is not a strict per-record cap within a pending chunk.
+A separate main-keypoint file can instead map document IDs to strings:
 
-Teacher prompts use the original query and body under the teacher's token
-budget. They are not first truncated to the student's 32-token query and
-768-token document windows. Consequently, some teacher judgments can depend
-on information unavailable to the student.
-
-### 2.6 Load data and construct tensor batches
-
-[`ScoredExamplesDataset`](../src/data/dataset.py) scans the scored JSONL once
-and records byte offsets for nonempty lines. It loads a row on demand with
-`seek` and `json.loads`, opening its file handle lazily. The offset list stays
-in memory, but full document bodies and query strings do not all remain
-resident.
-
-`Collator` turns a list of rows into tensors. Let:
-
-- $B$ be the number of keypoint rows in the batch;
-- $U\leq B$ be the number of distinct `doc_id` values;
-- $L$ be the configured padded document length;
-- $N$ and $N_h$ be the batch's padded ordinary- and hard-negative counts.
-
-The collator deduplicates document bodies by `doc_id`, keeping the first body
-for each ID, and builds a `doc_index` mapping from rows to unique documents.
-For example:
-
-```text
-Row document IDs:  [A, B, A]
-Unique documents: [A, B]
-doc_index:        [0, 1, 0]
+```json
+{"doc-001": "Borealis uses a 14 nm sensor."}
 ```
 
-Both document encoding and document-only losses operate on the two unique
-documents in this example. Query scores gather the appropriate bottleneck
-back for each of the three rows.
+The loader also accepts a single `{doc_id, keypoint}` record, a list of
+records, or JSONL records with `keypoint` or `main_keypoint` text.
+Pass the file using `--main-keypoints-path` or `data.main_keypoints_path`.
+Explicit main-keypoint fields and sidecar entries must agree. Legacy row
+`keypoint` fields are used only if every row for that document agrees
+across the entire dataset; ambiguous documents require an explicit choice.
+
+`ScoredExamplesDataset` scans rows and indexes byte offsets, retaining a
+canonical main-keypoint mapping. It validates repeated bodies and main
+keypoints. Bodies are loaded on demand rather than all kept in memory.
+Repeated query rows retain their own relevance supervision while sharing
+one document and one main keypoint in a batch.
+
+Training enables `require_full_document_teacher=True`. Every row must
+declare `teacher_metadata.document_scope: "full_document"`, with consistent
+teacher settings or external policy/source metadata. Old prefix-scored
+examples without this provenance are rejected. External targets must
+describe the full-document policy actually used to obtain them.
+
+The existing `build_index` joins the three upstream document/keypoint,
+positive-query, and negative-query sources by `doc_id` and exact keypoint
+string. It can produce several legacy keypoint rows per document; supply
+the designated main-keypoint association before training those rows.
+
+### 2.4 Build full-document coverage weights
+
+`build_idf_table` reads nonempty bodies from `keypoints_part*.jsonl` in
+the corpus directory. It tokenizes every body without truncation, counts
+each token ID once per original document, and deduplicates repeated
+`doc_id` records. Conflicting bodies and an empty corpus are rejected.
+Splitting documents for compression does not change the frequency unit.
+
+The saved token weight is:
+
+$$
+w(t)=\log\frac{N_{\mathrm{corpus}}+1}{\operatorname{df}(t)+1}.
+$$
+
+A ubiquitous token receives zero; an unseen token receives
+$\log(N_{\mathrm{corpus}}+1)$. The artifact includes compatibility metadata:
+
+```python
+{
+    "idf": idf_tensor,
+    "n_docs": n_docs,
+    "tokenizer": tokenizer_name,
+    "version": 2,
+    "formula": "log((N+1)/(df+1))",
+    "scope": "full_documents",
+}
+```
+
+Training verifies the metadata, tokenizer identity, vocabulary size, and
+finite nonnegative weights. Rebuild old signed-IDF or 4,096-token-prefix
+artifacts with the new CLI. For a custom corpus, supply original-document
+records containing `body` in files matching the corpus filename pattern.
+
+### 2.5 Precompute full-document teacher probabilities
+
+`QwenRerankerTeacher` formats the instruction, full query, and full document
+inside its yes/no prompt. One causal-LM forward pass reads final-position
+`yes` and `no` logits; their two-class softmax gives the target probability.
+Scoring runs without gradients.
+
+Neither text is truncated. If the complete formatted pair exceeds
+`teacher.max_length` or the configured budget exceeds the model context,
+the wrapper raises an error. The default total budget is 32,768 tokens.
+Longer documents need externally computed targets from an explicit
+long-document teacher policy.
+
+`precompute_teacher_scores` selects the first configured number of negative
+and hard-negative queries, flattens pairs, scores batches, and saves complete
+rows with `teacher_scores` and `teacher_metadata`. It always scores the
+full body, rather than a chunk or the student's shortened query.
+
+Precomputation resumes by output line count and verifies the existing
+teacher model, instruction, context budget, and document scope before
+appending. Input order and negative limits must still match the original
+run. Regenerate old truncated targets into a new file or use `--overwrite`;
+they cannot be silently mixed into a full-document run.
+
+### 2.6 Tensor batches and masks
+
+Let $B$ be the query-row count, $U$ the unique-document count,
+$N_c=\sum_D J_D$ the real chunk count, $C$ the chunk size, and
+$L_f^{\max}$ the longest main keypoint. `Collator` tokenizes every distinct
+body without truncation, splits it into chunks, and right-pads partial final
+chunks. Main keypoints retain every token and are padded to the batch maximum.
 
 | Batch field | Shape | Meaning |
 |---|---|---|
-| `doc_input_ids` | `(U, L)` | Truncated bodies, padded to `doc_max_len` |
-| `doc_attention_mask` | `(U, L)` | One for real document tokens, zero for padding |
-| `doc_index` | `(B,)` | Unique-document index for each keypoint row |
-| `direct_query_ids`, `indirect_query_ids` | `(B, L_Q)` each | Positive query token IDs |
-| `neg_query_ids` | `(B, N, L_Q)` | Ordinary negative queries |
-| `hardneg_query_ids` | `(B, N_h, L_Q)` | Hard negative queries |
-| `neg_query_mask`, `hardneg_query_mask` | `(B, N)`, `(B, N_h)` | Real query entries versus absent batch slots |
-| `teacher_direct`, `teacher_indirect` | `(B,)` each | Positive teacher scores |
-| `teacher_neg`, `teacher_hardneg` | `(B, N)`, `(B, N_h)` | Padded teacher-score arrays |
+| `doc_input_ids` | $(N_c,C)$ | All real document chunks |
+| `doc_attention_mask` | $(N_c,C)$ | Real tokens versus final-chunk padding |
+| `chunk_doc_index` | $(N_c,)$ | Unique-document owner per chunk |
+| `doc_index` | $(B,)$ | Unique-document owner per query row |
+| `keypoint_input_ids` | $(U,L_f^{\max})$ | Complete main keypoint per document |
+| `keypoint_attention_mask` | $(U,L_f^{\max})$ | Real keypoint tokens |
+| `direct_query_ids`, `indirect_query_ids` | $(B,L_Q)$ each | Fixed-slot positive queries |
+| `neg_query_ids`, `hardneg_query_ids` | $(B,N,L_Q)$, $(B,N_h,L_Q)$ | Padded negative-query entries |
+| `neg_query_mask`, `hardneg_query_mask` | $(B,N)$, $(B,N_h)$ | Real query entries |
+| `teacher_direct`, `teacher_indirect` | $(B,)$ each | Positive teacher targets |
+| `teacher_neg`, `teacher_hardneg` | $(B,N)$, $(B,N_h)$ | Negative teacher targets |
 
-Documents use the tokenizer's document padding behavior and an attention
-mask. Queries use `pad_query_ids`: no added special tokens, truncation to
-`query_max_len`, then right filling with the configured mask token. The
-collator validates that this token exists in the vocabulary.
+Query token fill slots participate in query encoding and MaxSim. Missing
+negative-query **entries** are different: their masks exclude them from BCE.
+Each negative tensor keeps at least one dummy entry for a uniform tensor
+path, including when that negative type is absent.
 
-There are two distinct meanings of padding here. Query **token** fill slots
-participate in encoding and scoring. Missing negative **query entries** are
-excluded from margin-MSE by the negative-query masks. Each negative tensor
-has at least one slot even when no query of that kind exists in a batch, so
-the training code can keep a uniform tensor path. Such dummy queries are
-encoded but contribute no valid margin pairs.
+### 2.7 Model interfaces and summary extraction
 
-### 2.7 Construct the model and its tensor interface
+The backbone is shared by document chunks, keypoint encoding, and the query
+embedding lookup. No frozen keypoint model is created. The loader uses SDPA,
+padding-only bidirectional attention, and no cache. The patch depends on
+the Qwen3 attention interface supported by the installed Transformers version.
 
-[`LatentBottleneckReranker.__init__`](../src/model/reranker.py) loads one
-`AutoModel` backbone, applies `make_bidirectional`, and passes references to
-its components into the two towers:
+Summary blocks implement CrossAttn → FFN1 → SelfAttn → FFN2, with pre-norm
+and a residual add at each step. Chunks start from the same learned summary
+queries. The following code names distinguish chunk tensors from complete
+document tensors:
 
-- `ResidualQueryAdapter` receives `backbone.get_input_embeddings()`.
-- `DocumentCompressor` receives the full backbone.
-
-These are shared parameter references, not independently copied models. The
-query path updates the same embedding table that the document path uses. No
-parameters are explicitly frozen. Newly added adapter, attention, and gate
-layers use normal PyTorch initialization; summary queries are initialized as
-Gaussian values scaled by 0.02.
-
-The backbone is loaded without forcing bf16 weights. The implementation keeps
-the master parameters in float32 and relies on Accelerate's mixed-precision
-execution during training. This also keeps the pretrained backbone compatible
-with freshly initialized float32 layers.
-
-[`make_bidirectional`](../src/model/bidirectional.py) replaces the backbone
-instance's `_update_causal_mask` method with a bound Python method. For a
-document attention mask, it builds an additive mask of shape `(U, 1, L, L)`:
-zero at attendable key positions and the dtype's minimum finite value at
-padded key positions. It removes the triangular restriction rather than
-changing the Transformer layer weights.
-
-This is a dependency on a private Transformers method. The function raises
-`TypeError` if the loaded backbone does not expose that method. Successful
-bidirectional behavior depends on a compatible model implementation and
-attention backend; the repository provides no dependency lockfile or
-compatibility test for that patch.
-
-`DocumentCompressor.forward(input_ids, attention_mask)` returns:
-
-| Key | Shape | Consumer |
+| Output key | Shape | Theory / use |
 |---|---|---|
-| `h_d` | `(U, L, d)` | Chamfer loss; norm diagnostics |
-| `doc_attention_mask` | `(U, L)` | Document token validity metadata |
-| `b_d` | `(U, M, d)` | Chamfer loss; representation inspection |
-| `pi` | `(U, M)` | Precision weighting; sparsity; gate diagnostics |
-| `b_d_tilde` | `(U, M, d)` | Relevance scoring |
+| `h_d` | $(N_c,C,d)$ | Contextualized chunk tokens for coverage |
+| `doc_attention_mask` | $(N_c,C)$ | Real-token mask |
+| `b_d` | $(N_c,M,d)$ | Ungated $S_r$, used by coverage |
+| `pi` | $(N_c,M)$ | Continuous gates |
+| `b_d_tilde` | $(N_c,M,d)$ | Gated $B_r$, before document packing |
+| `chunk_input_ids` | $(N_c,C)$ | IDs for IDF lookup |
+| `chunk_doc_index` | $(N_c,)$ | Chunk owners |
+| `document_vectors` | $(U,\max_D J_DM,d)$ | Packed gated document summaries |
+| `document_summary_mask` | $(U,\max_D J_DM)$ | Real summaries versus packing padding |
 
-The cross-attention block converts the document mask to a PyTorch
-`key_padding_mask`, where `True` means “ignore this key.” Its attention uses
-`batch_first=True`, eight heads by default, zero dropout, and does not return
-attention weights. It contains cross-attention and an FFN; there is no
-separate summary-slot self-attention layer.
+`encode_document(input_ids, attention_mask)` accepts complete document rows
+and chunks them internally. Already chunked inputs can supply
+`chunk_doc_index` and `num_documents` explicitly. `encode_keypoint` runs
+the whole keypoint through the same backbone. `encode_query` uses the
+shared embedding lookup and shallow adapter.
 
-`encode_query(input_ids)` returns `(batch, L_Q, d)`.
-`maxsim(q, b)` accepts broadcastable leading batch dimensions, builds the
-similarity matrix with `torch.einsum("...qd,...kd->...qk", q, b)`, multiplies
-by `1 / sqrt(hidden_size)`, takes the maximum over document slots, and sums
-over query slots.
+For whole-document `maxsim(q, b, summary_mask)`, use `document_vectors` and
+its mask. The maximum spans every real chunk before summing query slots.
+`scores_to_logits` applies $aS+b$, and `scores_to_probabilities` applies
+sigmoid. The effective positive scale is `softplus(score_alpha)`,
+initialized to 1; `score_bias` starts at 0. A tiny positive numerical floor
+prevents scale underflow.
 
-The model's `forward(mode=..., **kwargs)` dispatches to `encode_query` or
-`encode_document`. During training, these parameterized paths are called
-through the Accelerate-wrapped model's `__call__`, so a distributed wrapper
-can instrument the forward calls. `maxsim` has no trainable parameters of its
-own and is called on `accelerator.unwrap_model(model)`. This explains the
-mode dispatch; it is not an end-to-end `forward(query, document)` API.
+### 2.8 Training forward, losses, and saved artifacts
 
-### 2.8 Execute one training batch
+Each microbatch invokes `model(mode="training", batch=batch)` once. That
+wrapped forward includes document compression, keypoint encoding, all query
+encodings, document MaxSim, and the score scale/bias. Every trainable branch
+therefore belongs to the distributed wrapper's forward graph.
 
-[`forward_batch_and_loss`](../src/train.py) ties the representation paths
-to the four losses:
+Outputs include `doc_out`, `keypoint_vectors`, and row-wise `scores`,
+`logits`, and `probabilities`. Query columns are ordered direct, indirect,
+ordinary negatives, then hard negatives. `forward_batch_and_loss` computes:
 
-```text
-1. Encode U unique documents.
-2. Gather b_d_tilde[doc_index] to obtain B row-specific bottlenecks.
-3. Encode direct and indirect queries, then score each against its document.
-4. Flatten ordinary negatives from (B, N, L_Q) to (B*N, L_Q), encode,
-   restore their batch dimensions, and score against the same documents.
-5. Repeat for hard negatives.
-6. Stack the two positive score columns; concatenate both negative kinds.
-7. Compute margin-MSE over all valid positive-negative combinations.
-8. Compute Chamfer on U unique documents using h_d, b_d, pi, token IDs,
-   the document mask, and the IDF table.
-9. Compute direct/indirect score consistency over B rows.
-10. Compute summed gate mass averaged over U unique documents.
-11. Weight and add the four components.
-```
+1. Stable masked BCE-with-logits against teacher probabilities.
+2. Coverage of real chunk tokens by ungated summaries.
+3. Main-keypoint token matching against all gated document summaries.
+4. Gate sums across chunks, averaged over unique documents.
 
-[`src/losses.py`](../src/losses.py) implements these calculations directly.
-Margin masks are multiplied into the squared errors, with a denominator
-clamped to at least one. Chamfer casts representations to float32 before
-normalizing, masks padded document positions out of nearest-token precision,
-and clamps its gate-sum denominator. `total_loss` returns the differentiable
-scalar together with Python numeric values for component logging.
+Cosine matrices use float32 with autocast disabled and epsilon-safe norms.
+Zero-total-weight chunks contribute zero coverage and remain in the chunk
+average. Keypoint vectors retain gradients through the shared encoder.
+The requested keypoint score retains the positive-gate cancellation
+described in Part 1.
 
-There is no cross-document comparison in this batch path. A negative query
-for document A is scored against A, not against every document in the batch.
-Document deduplication is a compute optimization, not in-batch negative
-sampling.
+Training uses Accelerate, AdamW, linear warmup/decay, gradient accumulation,
+and gradient clipping. Incomplete batches are kept. The scheduler uses
+`ceil(len(prepared_loader) / grad_accum_steps) * epochs` after distributed
+loader preparation.
 
-The main training loop then:
-
-1. Seeds Python, NumPy, and PyTorch; initializes `Accelerator` with configured
-   gradient accumulation and optional bf16 mixed precision.
-2. Creates the tokenizer, model, IDF table, lazy dataset, and shuffled
-   DataLoader. `drop_last=True` drops incomplete batches.
-3. Prepares the DataLoader before computing schedule length, so its length
-   reflects distributed sharding. The schedule estimate is
-   `(len(prepared_loader) // grad_accum_steps) * epochs`.
-4. Creates AdamW and a linear warmup/decay scheduler, then prepares the model,
-   optimizer, and scheduler with Accelerate.
-5. Runs forward and backward inside `accelerator.accumulate(model)`, clips
-   gradients when they synchronize, and invokes the wrapped optimizer and
-   scheduler steps.
-6. Advances `global_step` on synchronized optimizer updates and saves/logs
-   from the main process.
-
-With batch size 8 and four accumulation steps, a full accumulation window
-contains 32 keypoint rows per process. Across $W$ processes, the nominal
-effective batch is $32W$ rows, subject to sharding and final partial-window
-behavior. The number of unique documents can be smaller.
-
-`total_steps` uses floor division, so it can underestimate updates if the
-prepared DataLoader has a final partial accumulation window. The code does
-not include a separate validation loop, early stopping, or model selection
-based on retrieval metrics.
-
-Training writes the following to the output directory:
-
-| Artifact | Contents |
+| Saved artifact | Contents |
 |---|---|
-| `metrics.csv` | Step, epoch, elapsed time, total loss, and all four unweighted loss components |
-| TensorBoard tracker output | The logged loss dictionary under tracker name `latent_reranker` |
-| `checkpoint-<step>.pt` | Full model `state_dict` at the configured save interval |
-| `final_model.pt` | Full model `state_dict` after the loop |
+| `config.yaml` | Effective configuration, including CLI overrides |
+| Tokenizer files | Student tokenizer saved with `save_pretrained` |
+| `metrics.csv` and TensorBoard | Total, BCE, coverage, keypoint, and sparsity |
+| `checkpoint-<step>.pt` | Periodic model `state_dict` |
+| `final_model.pt` | Final model `state_dict` |
 
-CSV and TensorBoard values are taken from the last microbatch at each
-synchronized update on the main process; the code does not explicitly average
-them across an accumulation window or all processes. Checkpoints contain
-weights, not optimizer, scheduler, random-generator, or data-iteration state.
-There is no training-resume CLI, and the configuration/tokenizer are not
-packaged into the checkpoint. Reloading requires the corresponding model
-configuration and tokenizer to be available.
+Loss logs describe the current microbatch on the main process. Checkpoints
+contain weights rather than optimizer, scheduler, RNG, or data-order state;
+full training resume is not implemented.
 
-### 2.9 Run the pipeline and use the learned representation
+### 2.9 Run training and score a complete document
 
-Run the shell wrappers from a Python environment with the required packages
-and access to the source data and pretrained model files:
+With dependencies installed and input data available:
 
 ```bash
-# 1. Join canonical bodies, positive queries, and negative queries.
+# When using the existing upstream sources, build joined query rows.
 ./scripts/run_build_index.sh
 
-# 2. Compute IDF using the student tokenizer.
+# Build version-2 nonnegative weights over full original documents.
 ./scripts/run_build_idf.sh
 
-# 3. Precompute teacher probabilities. This stage loads the 8B teacher.
+# Obtain full-document teacher probabilities and provenance.
 ./scripts/run_precompute_teacher.sh
 
-# 4. Train the student. This stage reads the saved scores, not the teacher.
-./scripts/run_train.sh
+# Supply the designated main keypoint per document.
+./scripts/run_train.sh --main-keypoints-path data/main_keypoints.json
 ```
 
-Each wrapper changes to the repository root and forwards extra arguments to
-its Python CLI. IDF construction and teacher precomputation are independent
-once their respective source inputs are available; training requires both
-outputs. Teacher precomputation additionally requires the unified JSONL.
-
-The source imports `torch`, `transformers`, `accelerate`, `numpy`, `PyYAML`,
-`tqdm`, and TensorBoard support for the core pipeline. Optional visualization
-uses `matplotlib`, and BEIR sampling uses `datasets`. The repository currently
-has no `requirements.txt`, `pyproject.toml`, or pinned dependency environment;
-in particular, the private attention patch and teacher's `logits_to_keep`
-argument require compatible Transformers implementations.
-
-Training can also be launched directly:
+The keypoint argument is optional when scored rows explicitly designate the
+main keypoint. Custom scored data and paths can be supplied directly:
 
 ```bash
 accelerate launch -m src.train \
   --config configs/default.yaml \
   --scored-path data/unified_examples.scored.jsonl \
   --idf-path data/idf_table.pt \
+  --main-keypoints-path data/main_keypoints.json \
   --output-dir runs/default
 ```
 
-For a minimal single-pair inference example using the existing API:
+For inference, tokenize the full document without truncation and use its
+packed summaries and validity mask:
 
 ```python
 import torch
@@ -1039,22 +1078,19 @@ from src.config import Config
 from src.data.dataset import pad_query_ids
 from src.model.reranker import LatentBottleneckReranker
 
-cfg = Config.from_yaml("configs/default.yaml")
-tokenizer = AutoTokenizer.from_pretrained(cfg.model.backbone_name)
+run_dir = "runs/default"
+cfg = Config.from_yaml(f"{run_dir}/config.yaml")
+tokenizer = AutoTokenizer.from_pretrained(run_dir)
 model = LatentBottleneckReranker(cfg.model)
 model.load_state_dict(
-    torch.load("runs/default/final_model.pt", map_location="cpu")
+    torch.load(f"{run_dir}/final_model.pt", map_location="cpu", weights_only=True)
 )
 model.eval()
 
 document = "Borealis uses a 14 nm sensor."
 query = "What sensor process does Borealis use?"
-doc_inputs = tokenizer(
-    document,
-    add_special_tokens=False,
-    truncation=True,
-    max_length=cfg.model.doc_max_len,
-    return_tensors="pt",
+inputs = tokenizer(
+    document, add_special_tokens=False, truncation=False, return_tensors="pt"
 )
 mask_id = tokenizer.convert_tokens_to_ids(cfg.model.mask_token)
 query_ids = torch.tensor([
@@ -1062,91 +1098,40 @@ query_ids = torch.tensor([
 ], dtype=torch.long)
 
 with torch.no_grad():
-    doc_out = model.encode_document(
-        doc_inputs["input_ids"], doc_inputs["attention_mask"]
+    doc_out = model.encode_document(inputs["input_ids"], inputs["attention_mask"])
+    q = model.encode_query(query_ids)
+    score = model.maxsim(
+        q, doc_out["document_vectors"], doc_out["document_summary_mask"]
     )
-    query_vectors = model.encode_query(query_ids)
-    score = model.maxsim(query_vectors, doc_out["b_d_tilde"])
+    probability = model.scores_to_probabilities(score)
 
-print(score.item())
+print(probability.item())
 ```
 
-This example runs on CPU with the model's ordinary loaded parameter dtype;
-it is an API illustration, not a latency benchmark. For many documents, a
-serving application could cache each `b_d_tilde`, encode the query once, score
-the cached representations, and sort the results. That cache and candidate
-management remain application code to be built.
+Keypoints are only required for training. A serving application can cache
+document summaries, encode each query once, and score cached representations.
+A persistent index and candidate-management service are outside this code.
 
-### 2.10 Inspect the compressor and understand the current scope
+### 2.10 Compatibility, diagnostics, and validation scope
 
-[`inspect_bottleneck.py`](../src/eval/inspect_bottleneck.py) loads the same
-model and optional checkpoint, sets evaluation mode, and encodes either raw
-`--text` or a `--doc-id` body found in a unified JSONL file. Omitting a
-checkpoint leaves the added compressor/adapter layers randomly initialized;
-the backbone still comes from the pretrained model.
+New self-attention, a second FFN per summary block, and scale/bias parameters
+make earlier checkpoints architecture-incompatible. Train this model from
+the pretrained backbone with normally initialized compressor layers.
 
-Its inspection modes include:
+Before migrating an earlier run:
 
-| Mode or option | What it reports |
-|---|---|
-| Default inspection | Top slots by gate, nearest vocabulary tokens, and nearest token occurrence in the document |
-| `--pi-only` | All gates, summary statistics, and counts above several thresholds |
-| `--out-heatmap` | PNG of slot/document-token cosine similarities |
-| `--out-html` | Document tokens colored by their nearest displayed slot |
-| `--compare-norms` | L2-norm statistics for pre-gate summaries and contextualized document tokens |
-| `--out-norm-plot` | Optional histogram for the norm comparison |
-| `--probe-token` | Similarity of a chosen token embedding to the highest-gated slots, with a bar plot |
+- Replace old configuration fields with current chunk and loss settings.
+- Rebuild IDF artifacts with version 2 and full-document scope.
+- Regenerate prefix-based teacher targets with full-document provenance.
+- Designate one main keypoint for documents with several legacy keypoints.
 
-For example, to inspect gate behavior without vocabulary comparisons:
+Inspection utilities encode the whole supplied document and flatten
+summaries across all chunks. They report gates, nearest raw embedding
+neighbors, cosine heatmaps, and vector norms. These are interpretability
+heuristics rather than factual reconstruction or ranking evaluation.
 
-```bash
-python -m src.eval.inspect_bottleneck \
-  --config configs/default.yaml \
-  --checkpoint runs/default/final_model.pt \
-  --text "Borealis uses a 14 nm sensor." \
-  --pi-only
-```
-
-The nearest-neighbor displays compare pre-gate `b_d` with **raw input
-embeddings** from the shared table, either over the whole vocabulary or over
-tokens present in the document. They do not compare contextualized `h_d`
-vectors in that display. The source explains this choice as a
-way to avoid dominant shared hidden-state dimensions overwhelming the visual
-nearest-neighbor comparison.
-
-The helper `_cos` itself is ordinary `torch.nn.functional.cosine_similarity`;
-it performs no whitening or per-dimension correction. Raw embedding neighbors
-are an interpretability heuristic, not a reconstruction of a slot's exact
-meaning or a display of the training attention weights. Scalar norm
-differences alone also cannot explain cosine differences, since cosine
-normalizes magnitude; the separate norm tool diagnoses scale relevant to
-dot-product scoring. If a probe string tokenizes into several pieces, the
-probe uses only its first piece.
-
-[`sample_beir_compress.py`](../src/eval/sample_beir_compress.py) loads a
-corpus through `datasets.load_dataset("BeIR/<name>", "corpus")`, combines
-title and text, samples documents with a seeded shuffle, and compresses them
-one at a time. It reports token counts, gate statistics, counts above 0.5 and
-0.1, and the vocabulary neighbor of the highest-gated slot. CSV output and
-multi-document HTML visualization are optional. Its CLI leaves the model on
-CPU and exposes no device option.
-
-These tools inspect representation and gate behavior. They do not load BEIR
-queries or relevance judgments, compute nDCG/MRR/recall, compare a reranking
-baseline, or measure deployment latency.
-
-The following distinctions define the implementation's current scope:
-
-| Design goal or possible extension | Current behavior |
-|---|---|
-| Bounded document representation | Implemented: every document produces exactly `num_summary_tokens` vectors before any external pruning. |
-| Adaptive physical vector count | Soft gates and threshold diagnostics exist; physical slot removal and a pruned storage format do not. |
-| Long-document reasoning | Attention can combine evidence within the retained input window; no chunking or recovery of truncated text is implemented. |
-| Two-teacher training | Generative outputs are external inputs; discriminative teacher scoring is implemented. |
-| Teacher margin matching | Implemented for varying queries against a fixed document, using probability differences. |
-| Lexical retention | Encouraged by residual query features and IDF-weighted geometry; exact fact preservation is not verified or guaranteed. |
-| Cross-document negatives | Not implemented, including in-batch document negatives. |
-| Listwise ranking objective | Not implemented; independent pair scoring can be used to order a candidate list. |
-| Persistent serving index or export | Not implemented; the code provides encoders, soft bottlenecks, and MaxSim. |
-| Training continuation | Weight checkpoints exist; full optimizer/scheduler resume does not. |
-| Ranking and hardware validation | Inspection utilities exist; automated ranking benchmarks, edge export, and latency measurements are absent. |
+Focused tests use tiny tokenizers/backbones and synthetic vectors to verify
+chunk retention, masks, teacher probabilities, loss reductions, and gradients
+without downloading pretrained weights. Full pretrained-model training,
+ranking evaluation, persistent indexing, hard pruning, quantization, export,
+and measured edge latency remain separate work.
