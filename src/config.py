@@ -46,7 +46,6 @@ class DataConfig:
     unified_path: str = "data/unified_examples.jsonl"
     idf_path: str = "data/idf_table.pt"
     scored_path: str = "data/unified_examples.scored.jsonl"
-    main_keypoints_path: Optional[str] = None
     neg_per_keypoint: int = 2
     hardneg_per_keypoint: int = 2
 

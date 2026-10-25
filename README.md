@@ -7,7 +7,7 @@ and bias convert that score into a sigmoid relevance prediction.
 
 The shared document/keypoint backbone is Qwen/Qwen3-Embedding-0.6B.
 The model trains jointly with soft-target BCE, normalized token coverage,
-main-keypoint matching, and summed-gate sparsity. The equations and detailed
+keypoint matching, and summed-gate sparsity. The equations and detailed
 implementation are in [docs/compression.md](docs/compression.md).
 
 ## Environment
@@ -26,7 +26,7 @@ separately loads the 8B reranker.
 Optional inspection plots use `matplotlib`; BEIR sampling uses
 `datasets`. The tests use tiny local models and require no model downloads.
 
-## Training data and main keypoints
+## Training data and keypoints
 
 Each scored JSONL row retains the existing query fields:
 
@@ -35,7 +35,6 @@ Each scored JSONL row retains the existing query fields:
   "doc_id": "doc-001",
   "body": "The full document, including all chunks.",
   "keypoint": "The fact that generated this row's queries.",
-  "main_keypoint": "The document's designated main factual content.",
   "direct_query": "A direct query",
   "indirect_query": "An indirect query",
   "negative_queries": ["An ordinary negative query"],
@@ -58,30 +57,11 @@ The numbers and text above illustrate the schema. Target arrays must match
 the corresponding query arrays, and every target must be finite and in
 [0, 1]. Direct and indirect queries each receive their own soft target.
 
-Use one main keypoint per document. If several query rows refer to the same
-document, they must agree on its body and main keypoint. The loader scans
-the file to check this association while keeping document bodies lazy.
-Queries may still be generated from several different row-level keypoints.
-
-You can supply the main keypoint in a separate JSON/JSONL file:
-
-```json
-{"doc_id": "doc-001", "keypoint": "The document's designated main keypoint."}
-```
-
-A JSON list of these records or a mapping from document ID to keypoint text
-also works. Set `data.main_keypoints_path` or pass:
-
-```bash
-accelerate launch -m src.train \
-  --config configs/default.yaml \
-  --main-keypoints-path data/main_keypoints.jsonl
-```
-
-An explicit `main_keypoint` or sidecar resolves documents with multiple
-row-level keypoints. The older `keypoint` field is accepted as the main
-keypoint only when all rows for that document agree across the complete
-file. Ambiguous legacy data raises an error.
+Use the existing `keypoint` on each row. A document can have several rows
+with different keypoints; repeated document IDs must agree on the body.
+Within a batch, documents are encoded once per `doc_id`, and keypoints are
+encoded once per distinct `(doc_id, keypoint)` pair. Each keypoint matches
+against all summaries of its associated document.
 
 ## Prepare and train
 
@@ -96,12 +76,12 @@ file. Ambiguous legacy data raises an error.
 ./scripts/run_precompute_teacher.sh
 
 # 4. Train the student with all four losses.
-./scripts/run_train.sh --main-keypoints-path data/main_keypoints.jsonl
+./scripts/run_train.sh
 ```
 
 The joiner consumes the existing upstream JSONL sources; keypoint and query
-generation remain external. Teacher precomputation preserves extra row
-fields, including an explicit main keypoint.
+generation remain external. Teacher precomputation preserves each row's
+existing `keypoint` field.
 
 Teacher targets describe whole documents, after all their chunk summaries
 are combined by the student. The teacher wrapper refuses prompts beyond its
@@ -150,8 +130,9 @@ The training components are:
 - **Sparsity:** sum gates over all chunks of each document, then average
   over unique documents.
 
-Coverage averages over unique chunks. Keypoint loss and sparsity average
-once per unique document, even when it has multiple query rows in a batch.
+Coverage averages over unique chunks, keypoint loss over distinct
+`(doc_id, keypoint)` pairs, and sparsity over unique documents. Repeating
+the same document/keypoint pair does not repeat its keypoint loss.
 Missing negative queries and padded document summary slots are masked.
 Cosine calculations run in float32, including under bf16 autocast.
 

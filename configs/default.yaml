@@ -23,9 +23,6 @@ data:
   unified_path: "data/unified_examples.jsonl"
   idf_path: "data/idf_table.pt"
   scored_path: "data/unified_examples.scored.jsonl"
-  # Optional JSON/JSONL mapping doc_id to one main keypoint.
-  # Alternatively, supply main_keypoint on every scored row.
-  main_keypoints_path: null
   neg_per_keypoint: 2
   hardneg_per_keypoint: 2
 

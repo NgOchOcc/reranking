@@ -82,9 +82,10 @@ quantize model weights, or produce a textual summary.
 | $S_D$ | Concatenated chunk summaries before gating | $(J_DM)\times d$ |
 | $\pi_D$ | Concatenated chunk gate values | $J_DM$ |
 | $B_D$ | Gated document summaries | $\operatorname{diag}(\pi_D)S_D\in\mathbb R^{(J_DM)\times d}$ |
-| $f_D$ | Main keypoint text associated with document $D$ | Supplied in JSON |
-| $L_f$ | Number of real tokens in $f_D$ | Full keypoint length |
+| $f$ | Keypoint text on a training row associated with document $D$ | Existing JSON `keypoint` field |
+| $L_f$ | Number of real tokens in $f$ | Full keypoint length |
 | $U_f$ | Contextualized keypoint token vectors | $L_f\times d$, shared full encoder |
+| $\mathcal F_B$ | Distinct document/keypoint pairs in a batch | $P=\lvert\mathcal F_B\rvert$ |
 | $Q_{\mathrm{latent}}$ | Encoded query vectors | $L_Q\times d$ |
 | $S_\theta(Q,D)$ | Raw student MaxSim relevance score | One unbounded scalar |
 | $a,b$ | Globally shared trainable score scale and bias | $a>0$, $b\in\mathbb R$ |
@@ -113,7 +114,7 @@ flowchart LR
     CAT --> MS
     MS --> Z[Trainable positive scale and bias]
     Z --> P[Sigmoid relevance probability]
-    F[Main keypoint token IDs] --> KE[Same full encoder on whole keypoint]
+    F[Row keypoint token IDs] --> KE[Same full encoder on whole keypoint]
     KE --> U[Contextualized keypoint tokens]
     U --> KM[Mean tokenwise cosine MaxSim]
     CAT --> KM
@@ -418,10 +419,9 @@ Teacher probabilities are precomputed and saved. During student training,
 the teacher is frozen, is not loaded into the student training loop, and
 receives no gradients.
 
-#### Main-keypoint JSON supervision
+#### Row-level keypoint JSON supervision
 
-Associate each document with its main keypoint $f_D$. For example, a
-document-linked JSON record can supply:
+Use the keypoint $f$ already present on each document-linked training row:
 
 ```json
 {
@@ -430,22 +430,20 @@ document-linked JSON record can supply:
 }
 ```
 
-The body for the same `doc_id` supplies the full document $D$. The loader
-accepts this record in a JSON/JSONL sidecar, or an explicit
-`main_keypoint` field on scored training rows. The keypoint text is used
-directly by the keypoint loss, in addition to organizing query supervision.
+The body for the same `doc_id` supplies the full document $D$. A document
+can have several rows with different keypoints. Each nonempty `keypoint`
+is used directly by the keypoint loss, in addition to organizing its row's
+query supervision. No additional keypoint field or separate file is needed.
 
-The theory assumes one designated, nonempty main keypoint per document.
-Several query rows for that document reuse the same main keypoint rather
-than multiplying its loss. The dataset checks the association across the
-entire scored file. Legacy rows with several different keypoints per
-document require an explicit main keypoint; the loader does not silently
-select a row.
+Within a batch, document encoding is shared by all rows with the same
+`doc_id`. Let $\mathcal F_B$ contain each distinct $(D,f)$ pair once;
+repeated rows for the same pair do not multiply its keypoint penalty.
+Different keypoints of the same document remain separate training targets.
 
 ### 1.7 The four training losses
 
 The revised objective combines soft-target binary cross-entropy for relevance,
-coverage within each chunk, matching the document's main keypoint, and
+coverage within each chunk, matching each row's associated keypoint, and
 sparsity over all of a document's gates.
 
 #### A. Soft-target binary cross-entropy: match teacher probabilities
@@ -557,13 +555,13 @@ $$
 Chunks with zero total token weight contribute zero to this average and
 remain included in its chunk count.
 
-#### C. Keypoint loss: preserve the document's main factual content
+#### C. Keypoint loss: preserve each row's factual content
 
-Tokenize the whole main keypoint $f_D$ and pass all of its real tokens
+Tokenize the whole row keypoint $f$ and pass all of its real tokens
 through the same full encoder used to contextualize document chunks:
 
 $$
-U_f=E_D(f_D)=[u_1,\ldots,u_{L_f}]
+U_f=E_D(f)=[u_1,\ldots,u_{L_f}]
 \in\mathbb R^{L_f\times d}.
 $$
 
@@ -579,14 +577,14 @@ Match each real keypoint token against the **gated** document summary set
 $B_D=\operatorname{diag}(\pi_D)S_D$:
 
 $$
-g(S_D,f_D)
+g(S_D,f)
 =\frac{1}{L_f}\sum_{i=1}^{L_f}
   \max_{\substack{1\leq r\leq J_D\\1\leq k\leq M}}
   \cos(u_i,b_{r,k}),
 \qquad b_{r,k}=\pi_{r,k}s_{r,k}.
 $$
 
-The notation $g(S_D,f_D)$ includes the gates through $B_D$. This is the
+The notation $g(S_D,f)$ includes the gates through $B_D$. This is the
 mean of each keypoint token's best cosine match across all real document
 chunks. The keypoint tokens have equal weight; the coverage IDF weights
 are not applied here. Multiple tokens may select the same summary slot,
@@ -595,7 +593,7 @@ and different tokens may match different chunks.
 Define the loss for that keypoint as requested:
 
 $$
-\mathcal L_{\mathrm{keypoint}}(D,f_D)=1-g(S_D,f_D).
+\mathcal L_{\mathrm{keypoint}}(D,f)=1-g(S_D,f).
 $$
 
 For exact cosine similarity on nonzero vectors, $g\in[-1,1]$ and this loss
@@ -603,7 +601,7 @@ lies in $[0,2]$. It is a matching objective, not a relevance probability.
 
 Exclude keypoint padding from encoder attention and the token average.
 Exclude padded or nonexistent document chunks from the maximum; zero-filled
-batch padding must not act as candidate summaries. Require a nonempty main
+batch padding must not act as candidate summaries. Require a nonempty row
 keypoint, so $L_f>0$. For numerical stability, implement cosine in float32
 with epsilon-safe normalization:
 
@@ -616,17 +614,19 @@ $$
 This gives zero similarity for an exactly zero vector. It is a numerical
 safeguard; padded candidates are still explicitly excluded.
 
-Let $\mathcal D_B$ be the set of unique documents in the batch, each with
-its designated main keypoint. Average the keypoint loss once per document:
+Average the keypoint loss over the $P=|\mathcal F_B|$ distinct
+document/keypoint pairs in the batch:
 
 $$
 \mathcal L_{\mathrm{keypoint}}
-=\frac{1}{|\mathcal D_B|}
-  \sum_{D\in\mathcal D_B}
-  \mathcal L_{\mathrm{keypoint}}(D,f_D).
+=\frac{1}{|\mathcal F_B|}
+  \sum_{(D,f)\in\mathcal F_B}
+  \mathcal L_{\mathrm{keypoint}}(D,f).
 $$
 
-Query rows that share a document do not repeat its keypoint loss.
+Rows sharing the same document and keypoint do not repeat that pair's loss.
+Different keypoints for one document each contribute a term while reusing
+the same document summaries.
 
 **Positive gate scaling cancels inside cosine.** For nonzero keypoint and
 summary vectors and $\pi_{r,k}>0$:
@@ -643,7 +643,8 @@ does not ensure that keypoint-matching slots survive sparsity or hard pruning.
 
 #### D. Sparsity loss: penalize total document gate mass
 
-Restore the sum-of-gates penalty, averaged over unique documents:
+Let $\mathcal D_B$ be the set of unique documents in the batch. Restore
+the sum-of-gates penalty, averaged over these documents:
 
 $$
 \mathcal L_{\mathrm{sparsity}}
@@ -696,7 +697,7 @@ Example starting weights for the revised theory are:
 | Parameter | Value | Effect |
 |---|---:|---|
 | $\lambda_{\mathrm{coverage}}$ | 1.0 | Strength of token coverage within each chunk |
-| $\lambda_{\mathrm{keypoint}}$ | 1.0 | Strength of matching the document's main keypoint |
+| $\lambda_{\mathrm{keypoint}}$ | 1.0 | Strength of matching each document/keypoint pair |
 | $\lambda_{\mathrm{sparsity}}$ | 0.01 | Cost of summed gate mass across a document's chunks |
 
 The shared embedding table and document/keypoint backbone, query adapter,
@@ -708,9 +709,10 @@ corpus-derived token weights remain fixed; keypoint token vectors are
 recomputed through the shared trainable encoder.
 
 BCE averages over valid query-document examples. Coverage averages over
-unique chunks, while keypoint loss and sparsity each average over unique
-documents. Repeated query rows add relevance supervision without repeating
-the document's auxiliary penalties in the batch. The four losses can have
+unique chunks, keypoint loss over unique document/keypoint pairs, and
+sparsity over unique documents. Repeated query rows add relevance
+supervision without repeating the same pair's keypoint penalty or the
+document's coverage and sparsity penalties. The four losses can have
 different scales; interpret their coefficients alongside separately logged
 component values.
 
@@ -755,9 +757,9 @@ interactions costing $O(M^2d)$ per chunk, in addition to projections and
 FFNs. Across $L$ blocks and $J_D$ chunks, those interaction costs are
 $O(LJ_D(MC+M^2)d)$. Training also retains uncompressed chunk states and
 computes an $\ell_r\times M$ cosine-distance matrix per chunk for coverage.
-Keypoint supervision adds a full encoder pass for each main keypoint and
-an $L_f\times(J_DM)$ cosine-similarity matrix for its document. These
-keypoint computations are needed during training; serving query-document
+Keypoint supervision adds a full encoder pass for each distinct $(D,f)$
+pair and an $L_f\times(J_DM)$ cosine-similarity matrix for its document.
+These keypoint computations are needed during training; serving query-document
 scores does not require the keypoint branch.
 
 The intended serving advantage comes from compressing chunks in advance
@@ -779,7 +781,7 @@ new training run.
 | Model, data, loss, teacher, and training configuration | [src/config.py](../src/config.py), [configs/default.yaml](../configs/default.yaml) |
 | Join upstream document, query, and negative-query files | [src/data/build_index.py](../src/data/build_index.py) |
 | Full-document corpus frequencies and coverage weights | [src/data/idf.py](../src/data/idf.py) |
-| Lazy scored rows, main-keypoint resolution, and chunk batching | [src/data/dataset.py](../src/data/dataset.py) |
+| Lazy scored rows, keypoint-pair deduplication, and chunk batching | [src/data/dataset.py](../src/data/dataset.py) |
 | Full-document teacher targets and resumable precomputation | [teacher wrapper](../src/distill/teacher_qwen_reranker.py), [precomputation](../src/distill/precompute_teacher_scores.py) |
 | Padding-only backbone attention | [src/model/bidirectional.py](../src/model/bidirectional.py) |
 | Shallow query encoder | [src/model/query_adapter.py](../src/model/query_adapter.py) |
@@ -800,7 +802,7 @@ The checked-in YAML uses the following settings:
 | Summary capacity | 32 slots per chunk; one refinement block; eight attention heads |
 | Query adapter | 32 slots, two layers, eight heads, fill token `<\|vision_pad\|>` |
 | Teacher budget | 32,768 tokens for the entire formatted input, including query and prompt |
-| Main-keypoint source | `data.main_keypoints_path` sidecar, or explicit scored-row fields |
+| Keypoint source | Existing `keypoint` field on each scored row |
 | Loss weights | Coverage 1.0, keypoint 1.0, sparsity 0.01; BCE coefficient 1 |
 | Optimizer | AdamW, learning rate `2e-5`, weight decay 0.01 |
 | Training | Batch size 8 query rows, four accumulation steps, five epochs, bf16 |
@@ -814,7 +816,7 @@ The data-building, IDF, and teacher-precomputation CLIs use their own
 arguments. Use teacher precomputation's `--max-length` to change its budget;
 editing a training YAML does not configure that separate CLI.
 
-### 2.3 Training rows and main-keypoint JSON
+### 2.3 Training rows and keypoints
 
 Training consumes teacher-scored JSONL. A minimal row has the following
 shape; values are illustrative:
@@ -823,7 +825,7 @@ shape; values are illustrative:
 {
   "doc_id": "doc-001",
   "body": "Borealis uses a 14 nm sensor.",
-  "main_keypoint": "Borealis uses a 14 nm sensor.",
+  "keypoint": "Borealis uses a 14 nm sensor.",
   "direct_query": "What sensor process does Borealis use?",
   "indirect_query": "What sensor process does Aurora's successor use?",
   "negative_queries": ["What material is Borealis's housing made from?"],
@@ -845,26 +847,14 @@ shape; values are illustrative:
 
 Negative query lists may be empty. Their teacher arrays must match their
 lengths and ordering. Every actual target must be a finite probability in
-$[0,1]$. Queries, document bodies, and main keypoints must be nonempty.
+$[0,1]$. Queries, document bodies, and each row's `keypoint` must be nonempty.
+Several rows may share a `doc_id` while supplying different keypoints.
 
-A separate main-keypoint file can instead map document IDs to strings:
-
-```json
-{"doc-001": "Borealis uses a 14 nm sensor."}
-```
-
-The loader also accepts a single `{doc_id, keypoint}` record, a list of
-records, or JSONL records with `keypoint` or `main_keypoint` text.
-Pass the file using `--main-keypoints-path` or `data.main_keypoints_path`.
-Explicit main-keypoint fields and sidecar entries must agree. Legacy row
-`keypoint` fields are used only if every row for that document agrees
-across the entire dataset; ambiguous documents require an explicit choice.
-
-`ScoredExamplesDataset` scans rows and indexes byte offsets, retaining a
-canonical main-keypoint mapping. It validates repeated bodies and main
-keypoints. Bodies are loaded on demand rather than all kept in memory.
-Repeated query rows retain their own relevance supervision while sharing
-one document and one main keypoint in a batch.
+`ScoredExamplesDataset` scans rows and indexes byte offsets. It validates
+that repeated document IDs have the same body. Bodies are loaded on demand
+rather than all kept in memory. The collator encodes each distinct document
+once and each distinct `(doc_id, keypoint)` pair once in a batch. Every
+query row retains its own relevance supervision.
 
 Training enables `require_full_document_teacher=True`. Every row must
 declare `teacher_metadata.document_scope: "full_document"`, with consistent
@@ -874,8 +864,7 @@ describe the full-document policy actually used to obtain them.
 
 The existing `build_index` joins the three upstream document/keypoint,
 positive-query, and negative-query sources by `doc_id` and exact keypoint
-string. It can produce several legacy keypoint rows per document; supply
-the designated main-keypoint association before training those rows.
+string. Its existing `keypoint` field is used directly for keypoint matching.
 
 ### 2.4 Build full-document coverage weights
 
@@ -937,10 +926,11 @@ they cannot be silently mixed into a full-document run.
 ### 2.6 Tensor batches and masks
 
 Let $B$ be the query-row count, $U$ the unique-document count,
-$N_c=\sum_D J_D$ the real chunk count, $C$ the chunk size, and
-$L_f^{\max}$ the longest main keypoint. `Collator` tokenizes every distinct
-body without truncation, splits it into chunks, and right-pads partial final
-chunks. Main keypoints retain every token and are padded to the batch maximum.
+$P$ the distinct document/keypoint-pair count, $N_c=\sum_D J_D$ the real
+chunk count, $C$ the chunk size, and $L_f^{\max}$ the longest keypoint.
+`Collator` tokenizes each distinct body without truncation, splits it into
+chunks, and right-pads partial final chunks. Keypoints retain every token
+and are padded to the batch maximum.
 
 | Batch field | Shape | Meaning |
 |---|---|---|
@@ -948,8 +938,9 @@ chunks. Main keypoints retain every token and are padded to the batch maximum.
 | `doc_attention_mask` | $(N_c,C)$ | Real tokens versus final-chunk padding |
 | `chunk_doc_index` | $(N_c,)$ | Unique-document owner per chunk |
 | `doc_index` | $(B,)$ | Unique-document owner per query row |
-| `keypoint_input_ids` | $(U,L_f^{\max})$ | Complete main keypoint per document |
-| `keypoint_attention_mask` | $(U,L_f^{\max})$ | Real keypoint tokens |
+| `keypoint_input_ids` | $(P,L_f^{\max})$ | Complete keypoint per distinct document/keypoint pair |
+| `keypoint_attention_mask` | $(P,L_f^{\max})$ | Real keypoint tokens |
+| `keypoint_doc_index` | $(P,)$ | Unique-document owner per keypoint pair |
 | `direct_query_ids`, `indirect_query_ids` | $(B,L_Q)$ each | Fixed-slot positive queries |
 | `neg_query_ids`, `hardneg_query_ids` | $(B,N,L_Q)$, $(B,N_h,L_Q)$ | Padded negative-query entries |
 | `neg_query_mask`, `hardneg_query_mask` | $(B,N)$, $(B,N_h)$ | Real query entries |
@@ -1005,18 +996,21 @@ wrapped forward includes document compression, keypoint encoding, all query
 encodings, document MaxSim, and the score scale/bias. Every trainable branch
 therefore belongs to the distributed wrapper's forward graph.
 
-Outputs include `doc_out`, `keypoint_vectors`, and row-wise `scores`,
-`logits`, and `probabilities`. Query columns are ordered direct, indirect,
+Outputs include `doc_out`, `keypoint_vectors` with shape $(P,L_f^{\max},d)$,
+and row-wise `scores`, `logits`, and `probabilities`. Query columns are ordered direct, indirect,
 ordinary negatives, then hard negatives. `forward_batch_and_loss` computes:
 
 1. Stable masked BCE-with-logits against teacher probabilities.
 2. Coverage of real chunk tokens by ungated summaries.
-3. Main-keypoint token matching against all gated document summaries.
+3. Keypoint token matching against all gated summaries of the associated
+   document, averaged over unique document/keypoint pairs.
 4. Gate sums across chunks, averaged over unique documents.
 
 Cosine matrices use float32 with autocast disabled and epsilon-safe norms.
 Zero-total-weight chunks contribute zero coverage and remain in the chunk
-average. Keypoint vectors retain gradients through the shared encoder.
+average. `keypoint_doc_index` selects each keypoint's document summaries
+and validity mask. Keypoint vectors retain gradients through the shared
+encoder.
 The requested keypoint score retains the positive-gate cancellation
 described in Part 1.
 
@@ -1051,19 +1045,17 @@ With dependencies installed and input data available:
 # Obtain full-document teacher probabilities and provenance.
 ./scripts/run_precompute_teacher.sh
 
-# Supply the designated main keypoint per document.
-./scripts/run_train.sh --main-keypoints-path data/main_keypoints.json
+# Train using the keypoint already present on each scored row.
+./scripts/run_train.sh
 ```
 
-The keypoint argument is optional when scored rows explicitly designate the
-main keypoint. Custom scored data and paths can be supplied directly:
+Custom scored data and paths can be supplied directly:
 
 ```bash
 accelerate launch -m src.train \
   --config configs/default.yaml \
   --scored-path data/unified_examples.scored.jsonl \
   --idf-path data/idf_table.pt \
-  --main-keypoints-path data/main_keypoints.json \
   --output-dir runs/default
 ```
 
@@ -1123,7 +1115,6 @@ Before migrating an earlier run:
 - Replace old configuration fields with current chunk and loss settings.
 - Rebuild IDF artifacts with version 2 and full-document scope.
 - Regenerate prefix-based teacher targets with full-document provenance.
-- Designate one main keypoint for documents with several legacy keypoints.
 
 Inspection utilities encode the whole supplied document and flatten
 summaries across all chunks. They report gates, nearest raw embedding

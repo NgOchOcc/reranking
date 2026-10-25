@@ -1,4 +1,4 @@
-"""Lazy scored rows, canonical main keypoints, and fixed-size chunk batches."""
+"""Lazy scored query/keypoint rows and complete-document chunk batches."""
 from __future__ import annotations
 
 import hashlib
@@ -23,69 +23,19 @@ def _keypoint_text(value, context):
     return value.strip()
 
 
-def _record_keypoint(record, context):
-    fields = [name for name in ("main_keypoint", "keypoint") if name in record]
-    if not fields:
-        raise ValueError(f"{context} needs main_keypoint or keypoint")
-    values = [_keypoint_text(record[name], f"{context}.{name}") for name in fields]
-    if any(value != values[0] for value in values[1:]):
-        raise ValueError(f"{context} has conflicting main_keypoint and keypoint fields")
-    return values[0]
-
-
-def load_main_keypoints(path):
-    """Read a JSON doc-id mapping, a record/list of records, or JSONL records."""
-    with open(path, encoding="utf-8") as handle:
-        text = handle.read()
-    if not text.strip():
-        raise ValueError(f"Main-keypoint file is empty: {path}")
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError:
-        payload = []
-        for line_number, line in enumerate(text.splitlines(), 1):
-            if line.strip():
-                try:
-                    payload.append(json.loads(line))
-                except json.JSONDecodeError as exc:
-                    raise ValueError(f"Invalid keypoint JSON at {path}:{line_number}") from exc
-    points = {}
-
-    def add(doc_id, point):
-        key = _document_key(doc_id)
-        point = _keypoint_text(point, f"Document {key!r} main keypoint")
-        if key in points and points[key] != point:
-            raise ValueError(f"Conflicting main keypoints for document {key!r}")
-        points[key] = point
-
-    if isinstance(payload, dict) and "doc_id" not in payload:
-        for doc_id, value in payload.items():
-            add(doc_id, _record_keypoint(value, f"Document {doc_id!r}") if isinstance(value, dict) else value)
-    else:
-        for index, record in enumerate(payload if isinstance(payload, list) else [payload]):
-            if not isinstance(record, dict) or "doc_id" not in record:
-                raise ValueError(f"Main-keypoint record {index} needs doc_id and keypoint text")
-            add(record["doc_id"], _record_keypoint(record, f"Main-keypoint record {index}"))
-    if not points:
-        raise ValueError(f"No main keypoints found in {path}")
-    return points
-
-
 class ScoredExamplesDataset(Dataset):
-    """Index byte offsets and resolve one main keypoint per document.
+    """Index scored rows without retaining document bodies in memory.
 
-    A sidecar or explicit main_keypoint field designates the main keypoint.
-    Legacy keypoint fields are a fallback only if every row for that document
-    agrees across the whole file. Bodies remain lazily loaded.
+    Each row supplies its own nonempty keypoint. Different keypoints for the
+    same document are valid and remain associated with their source rows.
     """
 
-    def __init__(self, path, main_keypoints_path=None, require_full_document_teacher=False):
+    def __init__(self, path, require_full_document_teacher=False):
         self.path = path
         self._fh = None
         self._fh_pid = None
         self.offsets = []
-        self.main_keypoints = load_main_keypoints(main_keypoints_path) if main_keypoints_path else {}
-        legacy, ambiguous, body_digests, document_ids = {}, set(), {}, set()
+        body_digests = {}
         teacher_settings = None
         with open(path, "rb") as handle:
             offset = 0
@@ -113,7 +63,6 @@ class ScoredExamplesDataset(Dataset):
                             raise ValueError("Scored rows use inconsistent teacher settings or document policies")
                         teacher_settings = settings
                     key = _document_key(row.get("doc_id"))
-                    document_ids.add(key)
                     body = row.get("body")
                     if not isinstance(body, str) or not body.strip():
                         raise ValueError(f"Document {key!r} has an empty or invalid body")
@@ -121,31 +70,11 @@ class ScoredExamplesDataset(Dataset):
                     if key in body_digests and body_digests[key] != digest:
                         raise ValueError(f"Conflicting bodies for document {key!r}")
                     body_digests[key] = digest
-                    if "main_keypoint" in row:
-                        point = _keypoint_text(row["main_keypoint"], f"Document {key!r} main_keypoint")
-                        if key in self.main_keypoints and self.main_keypoints[key] != point:
-                            raise ValueError(f"Conflicting main keypoints for document {key!r}")
-                        self.main_keypoints[key] = point
-                    if isinstance(row.get("keypoint"), str) and row["keypoint"].strip():
-                        point = row["keypoint"].strip()
-                        if key in legacy and legacy[key] != point:
-                            ambiguous.add(key)
-                        legacy[key] = point
+                    _keypoint_text(row.get("keypoint"), f"Document {key!r} row keypoint")
                     self.offsets.append(offset)
                 offset += len(line)
         if not self.offsets:
             raise ValueError(f"Scored examples file is empty: {path}")
-        for key in document_ids:
-            if key in self.main_keypoints:
-                continue
-            if key in ambiguous:
-                raise ValueError(
-                    f"Document {key!r} has multiple legacy keypoints; provide an explicit "
-                    "main_keypoint field or --main-keypoints-path"
-                )
-            if key not in legacy:
-                raise ValueError(f"Document {key!r} has no nonempty main keypoint")
-            self.main_keypoints[key] = legacy[key]
 
     def __len__(self):
         return len(self.offsets)
@@ -158,9 +87,7 @@ class ScoredExamplesDataset(Dataset):
             self._fh = open(self.path, "rb")
             self._fh_pid = pid
         self._fh.seek(self.offsets[idx])
-        row = json.loads(self._fh.readline())
-        row["main_keypoint"] = self.main_keypoints[_document_key(row["doc_id"])]
-        return row
+        return json.loads(self._fh.readline())
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -181,9 +108,9 @@ def _probability(value, context):
 
 
 class Collator:
-    """Deduplicate documents, chunk every token, and encode full main keypoints."""
+    """Deduplicate documents and (document, keypoint) pairs independently."""
 
-    def __init__(self, tokenizer, model_cfg, main_keypoints=None):
+    def __init__(self, tokenizer, model_cfg):
         self.tokenizer = tokenizer
         self.query_max_len = model_cfg.query_max_len
         self.doc_chunk_size = model_cfg.doc_chunk_size
@@ -197,10 +124,6 @@ class Collator:
             self.pad_token_id = tokenizer.eos_token_id
         if self.pad_token_id is None:
             raise ValueError("Tokenizer needs pad_token_id or eos_token_id for masked padding")
-        self.main_keypoints = {
-            _document_key(key): _keypoint_text(value, f"Document {key!r} main keypoint")
-            for key, value in (main_keypoints or {}).items()
-        }
 
     def _tok_query(self, text):
         if not isinstance(text, str) or not text.strip():
@@ -218,32 +141,31 @@ class Collator:
     def __call__(self, batch):
         if not batch:
             raise ValueError("Cannot collate an empty batch")
-        unique_ids, unique_bodies, unique_points, doc_index = {}, [], [], []
+        unique_ids, unique_bodies, doc_index = {}, [], []
+        unique_pairs, unique_points, keypoint_doc_index = set(), [], []
         for row in batch:
             key = _document_key(row.get("doc_id"))
-            point = _keypoint_text(
-                row.get("main_keypoint", self.main_keypoints.get(key)),
-                f"Document {key!r} main_keypoint",
-            )
-            if key in self.main_keypoints and self.main_keypoints[key] != point:
-                raise ValueError(f"Conflicting main keypoints for document {key!r}")
+            point = _keypoint_text(row.get("keypoint"), f"Document {key!r} row keypoint")
             body = row.get("body")
             if not isinstance(body, str) or not body.strip():
                 raise ValueError(f"Document {key!r} must have a nonempty body")
             if key not in unique_ids:
                 unique_ids[key] = len(unique_bodies)
                 unique_bodies.append(body)
-                unique_points.append(point)
             else:
                 idx = unique_ids[key]
                 if unique_bodies[idx] != body:
                     raise ValueError(f"Conflicting bodies for document {key!r}")
-                if unique_points[idx] != point:
-                    raise ValueError(f"Conflicting main keypoints for document {key!r}")
-            doc_index.append(unique_ids[key])
+            owner = unique_ids[key]
+            doc_index.append(owner)
+            pair = (key, point)
+            if pair not in unique_pairs:
+                unique_pairs.add(pair)
+                unique_points.append(point)
+                keypoint_doc_index.append(owner)
 
-        chunk_ids, chunk_masks, chunk_doc_index, keypoint_ids = [], [], [], []
-        for doc_idx, (body, point) in enumerate(zip(unique_bodies, unique_points)):
+        chunk_ids, chunk_masks, chunk_doc_index = [], [], []
+        for doc_idx, body in enumerate(unique_bodies):
             ids = self._tok_full(body, f"Document {doc_idx}")
             for start in range(0, len(ids), self.doc_chunk_size):
                 chunk = ids[start:start + self.doc_chunk_size]
@@ -251,9 +173,12 @@ class Collator:
                 chunk_ids.append(chunk + [self.pad_token_id] * (self.doc_chunk_size - n_real))
                 chunk_masks.append([1] * n_real + [0] * (self.doc_chunk_size - n_real))
                 chunk_doc_index.append(doc_idx)
-            keypoint_ids.append(self._tok_full(point, f"Document {doc_idx} keypoint"))
+        keypoint_ids = [
+            self._tok_full(point, f"Document {owner} keypoint")
+            for owner, point in zip(keypoint_doc_index, unique_points)
+        ]
         keypoint_tensor = torch.full(
-            (len(unique_bodies), max(map(len, keypoint_ids))), self.pad_token_id, dtype=torch.long,
+            (len(unique_points), max(map(len, keypoint_ids))), self.pad_token_id, dtype=torch.long,
         )
         keypoint_mask = torch.zeros_like(keypoint_tensor)
         for i, ids in enumerate(keypoint_ids):
@@ -301,6 +226,7 @@ class Collator:
             "doc_attention_mask": torch.tensor(chunk_masks, dtype=torch.long),
             "chunk_doc_index": torch.tensor(chunk_doc_index, dtype=torch.long),
             "doc_index": torch.tensor(doc_index, dtype=torch.long),
+            "keypoint_doc_index": torch.tensor(keypoint_doc_index, dtype=torch.long),
             "keypoint_input_ids": keypoint_tensor,
             "keypoint_attention_mask": keypoint_mask,
             "direct_query_ids": torch.tensor(direct_ids, dtype=torch.long),

@@ -55,7 +55,7 @@ class LatentBottleneckReranker(nn.Module):
         if input_ids.ndim != 2 or attention_mask.shape != input_ids.shape:
             raise ValueError("Keypoint IDs and masks must have matching 2D shapes")
         if input_ids.shape[0] == 0 or not attention_mask.bool().any(dim=1).all():
-            raise ValueError("Every main keypoint must contain at least one real token")
+            raise ValueError("Every keypoint must contain at least one real token")
         return self.backbone(input_ids=input_ids, attention_mask=attention_mask,
                              use_cache=False).last_hidden_state
 
@@ -148,11 +148,19 @@ class LatentBottleneckReranker(nn.Module):
 
     def _training_forward(self, batch):
         """Keep all trainable branches in a single DDP-instrumented forward."""
+        keypoint_doc_index = batch["keypoint_doc_index"]
+        keypoint_count = batch["keypoint_input_ids"].shape[0]
+        if keypoint_doc_index.ndim != 1 or keypoint_doc_index.shape[0] != keypoint_count:
+            raise ValueError("keypoint_doc_index must contain one document owner per keypoint")
+        if keypoint_doc_index.dtype != torch.long:
+            raise ValueError("keypoint_doc_index must use torch.long integer indices")
         doc_out = self.encode_document(
             batch["doc_input_ids"], batch["doc_attention_mask"],
             chunk_doc_index=batch["chunk_doc_index"],
-            num_documents=batch["keypoint_input_ids"].shape[0],
         )
+        num_documents = doc_out["document_vectors"].shape[0]
+        if ((keypoint_doc_index < 0) | (keypoint_doc_index >= num_documents)).any():
+            raise ValueError("keypoint_doc_index must reference an encoded document")
         keypoint_vectors = self.encode_keypoint(batch["keypoint_input_ids"], batch["keypoint_attention_mask"])
         query_ids = torch.cat([
             batch["direct_query_ids"].unsqueeze(1), batch["indirect_query_ids"].unsqueeze(1),

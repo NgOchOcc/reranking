@@ -55,11 +55,12 @@ def forward_batch_and_loss(model, batch, idf_table, loss_cfg, accelerator):
     )
     keypoint = keypoint_loss(
         outputs["keypoint_vectors"], batch["keypoint_attention_mask"],
-        doc_out["document_vectors"], doc_out["document_summary_mask"],
+        doc_out["document_vectors"][batch["keypoint_doc_index"]],
+        doc_out["document_summary_mask"][batch["keypoint_doc_index"]],
     )
     sparsity = sparsity_loss(
         doc_out["pi"], doc_out["chunk_doc_index"],
-        num_documents=batch["keypoint_input_ids"].shape[0],
+        num_documents=doc_out["document_vectors"].shape[0],
     )
     return total_loss(bce, coverage, keypoint, sparsity, loss_cfg)
 
@@ -88,7 +89,6 @@ def main():
     ap.add_argument("--config", default=None)
     ap.add_argument("--scored-path", default=None, help="override data.scored path from config")
     ap.add_argument("--idf-path", default=None)
-    ap.add_argument("--main-keypoints-path", default=None, help="JSON/JSONL with the main keypoint for each doc_id")
     ap.add_argument("--output-dir", default=None)
     args = ap.parse_args()
 
@@ -97,8 +97,6 @@ def main():
         cfg.data.scored_path = args.scored_path
     if args.idf_path:
         cfg.data.idf_path = args.idf_path
-    if args.main_keypoints_path:
-        cfg.data.main_keypoints_path = args.main_keypoints_path
     if args.output_dir:
         cfg.train.output_dir = args.output_dir
     scored_path = args.scored_path or cfg.data.scored_path
@@ -123,10 +121,7 @@ def main():
 
     idf_table = load_idf_table(idf_path, cfg.model.backbone_name, len(tokenizer))
 
-    dataset = ScoredExamplesDataset(
-        scored_path, main_keypoints_path=cfg.data.main_keypoints_path,
-        require_full_document_teacher=True,
-    )
+    dataset = ScoredExamplesDataset(scored_path, require_full_document_teacher=True)
     if not len(dataset):
         raise ValueError("Training data contains no scored examples")
     collator = Collator(tokenizer, cfg.model)

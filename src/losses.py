@@ -93,11 +93,11 @@ def coverage_loss(h_d, doc_attention_mask, b_d, doc_token_ids, idf_table, eps=1e
 
 
 def keypoint_loss(keypoint_vectors, keypoint_attention_mask, document_vectors, document_summary_mask, eps=1e-8):
-    """Mean 1-minus-tokenwise-cosine-MaxSim over unique documents.
+    """Mean 1-minus-tokenwise-cosine-MaxSim over unique document-keypoint pairs.
 
-    keypoint_vectors: (Nd, Lf, d), one shared-encoder vector per keypoint token;
-    document_vectors: (Nd, Ns, d), all gated summaries from real chunks;
-    the masks have shape (Nd, Lf) and (Nd, Ns), respectively.
+    keypoint_vectors: (P, Lf, d), one shared-encoder vector per keypoint token;
+    document_vectors: (P, Ns, d), each pair's owning document's gated summaries;
+    the masks have shape (P, Lf) and (P, Ns), respectively.
     Positive gates cancel inside cosine above the norm epsilon. Both vector
     inputs retain gradients, including the shared keypoint encoder path.
     """
@@ -113,7 +113,7 @@ def keypoint_loss(keypoint_vectors, keypoint_attention_mask, document_vectors, d
         "document_summary_mask",
     )
     if not real_tokens.any(dim=1).all():
-        raise ValueError("every document must have a nonempty main keypoint")
+        raise ValueError("every keypoint must contain at least one real token")
     if not real_summaries.any(dim=1).all():
         raise ValueError("every document must have at least one real summary")
 
