@@ -9,10 +9,13 @@ limiting the vector budget per chunk.
 Part 1 specifies the revised theory: chunk-based compression, summary blocks
 with cross-attention and self-attention, and four losses: soft-target binary
 cross-entropy, token-weighted coverage, keypoint matching, and gate sparsity.
-Part 2 describes the corresponding Python implementation, its data formats,
-and the training and inference APIs. Architectural motivations are
-distinguished from properties that the losses actually enforce. The repository
-does not include measured ranking or edge-latency results.
+Coverage token targets and keypoint token targets both come from a frozen
+copy of the original pretrained embedding model. Part 2 describes the current
+Python implementation, its data formats, the training and inference APIs,
+and the changes still needed to use those frozen targets. Architectural
+motivations are distinguished from properties that the losses actually
+enforce. The repository does not include measured ranking or edge-latency
+results.
 
 - [Part 1: Theory](#part-1-theory)
 - [Part 2: Implementation](#part-2-implementation)
@@ -75,7 +78,10 @@ quantize model weights, or produce a textual summary.
 | $d$ | Vector width | 1024 |
 | $M$ | Number of bottleneck slots per chunk | 32 |
 | $L$ | Number of summary refinement blocks | Configurable |
-| $H_r$ | Contextualized tokens of chunk $r$ | $\ell_r\times d$ before padding |
+| $E_D$ | Trainable student document encoder | Initialized from the embedding checkpoint |
+| $E_{\mathrm{emb}}^0$ | Original pretrained embedding teacher | Separate frozen model, original weights and encoding behavior |
+| $H_r$ | Student contextualized tokens of chunk $r$ | $\ell_r\times d$; input to summary extraction |
+| $H_r^T$ | Frozen teacher contextualized tokens of chunk $r$ | $\ell_r\times d$; coverage targets |
 | $S_r=Z_r^{(L)}$ | Chunk summaries before gating | $M\times d$ |
 | $\pi_r$ | Continuous gate values for chunk $r$ | $M$ |
 | $B_r$ | Chunk bottleneck after multiplicative gating | $M\times d$ |
@@ -84,7 +90,7 @@ quantize model weights, or produce a textual summary.
 | $B_D$ | Gated document summaries | $\operatorname{diag}(\pi_D)S_D\in\mathbb R^{(J_DM)\times d}$ |
 | $f$ | Keypoint text on a training row associated with document $D$ | Existing JSON `keypoint` field |
 | $L_f$ | Number of real tokens in $f$ | Full keypoint length |
-| $U_f$ | Contextualized keypoint token vectors | $L_f\times d$, shared full encoder |
+| $U_f^T$ | Frozen teacher contextualized keypoint token vectors | $L_f\times d$, from $E_{\mathrm{emb}}^0$ |
 | $\mathcal F_B$ | Distinct document/keypoint pairs in a batch | $P=\lvert\mathcal F_B\rvert$ |
 | $Q_{\mathrm{latent}}$ | Encoded query vectors | $L_Q\times d$ |
 | $S_\theta(Q,D)$ | Raw student MaxSim relevance score | One unbounded scalar |
@@ -93,14 +99,14 @@ quantize model weights, or produce a textual summary.
 | $p_\theta(Q,D)$ | Student relevance probability | $\sigma(z_\theta(Q,D))$ |
 | $p_T(Q,D)$ | Frozen discriminative teacher target | A yes/no probability |
 
-The relevance model has separate query and document paths, with an additional
-keypoint branch during training:
+The relevance model has separate query and document paths. During training,
+the original embedding teacher supplies both coverage and keypoint targets:
 
 ```mermaid
 flowchart LR
     D[Full document token IDs] --> CH[Split into fixed-size chunks]
-    CH --> ED[Shared document Transformer per chunk]
-    ED --> H[Contextualized chunk tokens H_r]
+    CH --> ED[Trainable student document Transformer per chunk]
+    ED --> H[Student contextualized chunk tokens H_r]
     SQ[Shared learned summary queries] --> CA[Cross-attention, FFN1, self-attention, FFN2]
     H --> CA
     CA --> BD[Ungated chunk summaries S_r]
@@ -114,8 +120,12 @@ flowchart LR
     CAT --> MS
     MS --> Z[Trainable positive scale and bias]
     Z --> P[Sigmoid relevance probability]
-    F[Row keypoint token IDs] --> KE[Same full encoder on whole keypoint]
-    KE --> U[Contextualized keypoint tokens]
+    CH --> TE[Frozen original embedding teacher]
+    TE --> HT[Detached teacher chunk tokens H_r^T]
+    HT --> CV[IDF-weighted coverage loss]
+    BD --> CV
+    F[Row keypoint token IDs] --> TE
+    TE --> U[Detached teacher keypoint tokens U_f^T]
     U --> KM[Mean tokenwise cosine MaxSim]
     CAT --> KM
     KM --> KL[Keypoint loss]
@@ -198,6 +208,12 @@ attention within each chunk and fully trainable weights. Each real token can inc
 evidence before and after its position within that chunk. The chunk encoder
 has no access to tokens in another chunk, so it does not provide contextual
 reasoning across chunk boundaries.
+
+These trainable student states $H_r$ are the compressor's inputs. The coverage
+targets are separate states $H_r^T$ from the original frozen embedding
+teacher, defined in Section 1.6. Detaching the current student states would
+still produce targets that change as the student learns and would not meet
+this requirement.
 
 #### Stage B: extract and refine a fixed set of summary vectors
 
@@ -377,9 +393,10 @@ The model produces one prediction per query-document pair. These predictions
 can order a candidate list, while the training objective below supervises
 individual pairs rather than a listwise softmax or a ranking metric directly.
 
-### 1.6 Two teachers provide different kinds of supervision
+### 1.6 Three teachers provide different kinds of supervision
 
-The design separates generating useful questions from judging relevance.
+The design separates generating useful questions, judging relevance, and
+providing fixed embedding-space targets.
 
 **The generative teacher supplies training examples.** Upstream generation
 produces keypoints, direct queries, indirect queries, negative queries, and
@@ -415,9 +432,40 @@ beyond the teacher's context budget requires a defined long-document teacher
 policy. The implemented teacher rejects inputs beyond its configured context
 budget instead of silently truncating the document.
 
-Teacher probabilities are precomputed and saved. During student training,
-the teacher is frozen, is not loaded into the student training loop, and
-receives no gradients.
+Relevance-teacher probabilities are precomputed and saved. During student
+training, this reranker teacher is not loaded into the student training loop
+and receives no gradients.
+
+**The original embedding teacher supplies coverage and keypoint targets.**
+Let $E_{\mathrm{emb}}^0$ be a separate frozen copy of the original pretrained
+`Qwen/Qwen3-Embedding-0.6B` checkpoint, before student fine-tuning or the
+student's bidirectional attention modification. Use its original tokenizer,
+preprocessing, and attention behavior consistently for both target branches.
+It retains its original weights throughout training and shares no trainable
+parameters with $E_D$. Both encoders have width $d=1024$ in this design.
+
+For each document chunk and whole keypoint, obtain token-level hidden states:
+
+$$
+H_r^T=\operatorname{stopgrad}\!\left(E_{\mathrm{emb}}^0(C_r)\right)
+=[h_{r,1}^T,\ldots,h_{r,\ell_r}^T],
+\qquad
+U_f^T=\operatorname{stopgrad}\!\left(E_{\mathrm{emb}}^0(f)\right).
+$$
+
+Here $\operatorname{stopgrad}$ treats the output as a constant during
+backpropagation. Run the embedding teacher in evaluation mode with all
+parameters frozen and gradient recording disabled. Use the same original
+tokenizer and chunk boundaries for student and teacher document inputs so
+coverage vectors, masks, token IDs, and IDF weights align position by
+position. The student may update its own embedding table and backbone;
+those updates never change the teacher.
+
+Teacher token vectors can be computed during training or cached with their
+checkpoint revision, encoding settings, token IDs, and masks. Coverage uses
+the teacher's chunk states; keypoint matching uses the same teacher on the
+whole keypoint. Neither branch uses pooled embeddings. The embedding teacher
+is needed only to obtain training targets and is not required for serving.
 
 #### Row-level keypoint JSON supervision
 
@@ -489,8 +537,9 @@ Missing query entries contribute neither loss nor count.
 #### B. Coverage loss: preserve weighted token coverage within each chunk
 
 Relevance supervision observes only the questions present in the training
-data. Coverage compares a chunk's contextualized tokens $H_r$ with **that
-same chunk's** ungated summaries $S_r$. Coverage remains local to each
+data. Coverage compares the original embedding teacher's frozen
+contextualized tokens $H_r^T$ with **that same chunk's** trainable ungated
+summaries $S_r$. Coverage remains local to each
 chunk. The keypoint loss below instead matches against summaries from all
 chunks of the associated document.
 
@@ -499,12 +548,14 @@ summary slots $k=1,\ldots,M$:
 
 $$
 c_{r,jk}
-=1-\frac{h_{r,j}^\top s_{r,k}}
-        {\lVert h_{r,j}\rVert\lVert s_{r,k}\rVert}.
+=1-\frac{(h_{r,j}^T)^\top s_{r,k}}
+        {\lVert h_{r,j}^T\rVert\lVert s_{r,k}\rVert}.
 $$
 
 Normalize vectors in float32 with a small norm epsilon for numerical
-stability. Exclude padded token positions from coverage.
+stability. Exclude padded token positions from coverage. Gradients flow
+through $S_r$ into the student compressor and document encoder, while
+$H_r^T$ and the original embedding teacher remain fixed.
 
 Use the revised nonnegative IDF weight for each real token:
 
@@ -557,21 +608,23 @@ remain included in its chunk count.
 
 #### C. Keypoint loss: preserve each row's factual content
 
-Tokenize the whole row keypoint $f$ and pass all of its real tokens
-through the same full encoder used to contextualize document chunks:
+Tokenize the whole row keypoint $f$ and pass all of its real tokens through
+the original frozen embedding teacher used for coverage targets:
 
 $$
-U_f=E_D(f)=[u_1,\ldots,u_{L_f}]
+U_f^T=\operatorname{stopgrad}\!\left(E_{\mathrm{emb}}^0(f)\right)
+=[u_1^T,\ldots,u_{L_f}^T]
 \in\mathbb R^{L_f\times d}.
 $$
 
-This shares the backbone and input embedding table with the document path.
-It produces one contextualized vector per keypoint token, without pooling,
-summary compression, or the query adapter's fixed 32-slot truncation. The
-keypoint encoder is trainable and shares parameters with the document
-encoder; its outputs are not detached targets or a separate frozen teacher.
-Since both sides have width $d$, the reference projection $P_\phi$ is the
-identity.
+This produces one fixed contextualized target vector per keypoint token,
+without pooling, summary compression, or the query adapter's fixed 32-slot
+truncation. The keypoint encoder is the original embedding teacher, with
+frozen weights independent of the trainable student document encoder.
+Its outputs are detached targets. Gradients flow through the matched student
+summaries into the compressor and student backbone, but never through
+$U_f^T$ or the teacher. Since both sides have width $d$, the reference
+projection $P_\phi$ is the identity.
 
 Match each real keypoint token against the **gated** document summary set
 $B_D=\operatorname{diag}(\pi_D)S_D$:
@@ -580,7 +633,7 @@ $$
 g(S_D,f)
 =\frac{1}{L_f}\sum_{i=1}^{L_f}
   \max_{\substack{1\leq r\leq J_D\\1\leq k\leq M}}
-  \cos(u_i,b_{r,k}),
+  \cos(u_i^T,b_{r,k}),
 \qquad b_{r,k}=\pi_{r,k}s_{r,k}.
 $$
 
@@ -632,7 +685,7 @@ the same document summaries.
 summary vectors and $\pi_{r,k}>0$:
 
 $$
-\cos(u_i,\pi_{r,k}s_{r,k})=\cos(u_i,s_{r,k}).
+\cos(u_i^T,\pi_{r,k}s_{r,k})=\cos(u_i^T,s_{r,k}).
 $$
 
 Consequently, the requested keypoint loss aligns summary directions but has
@@ -668,11 +721,11 @@ Lower gate mass is therefore neither a guarantee of a particular active
 slot count nor a physical reduction in stored vectors. That reduction still
 requires a separate pruning policy.
 
-Coverage and keypoint matching both use cosine directions, which do not
-enforce the vector magnitudes used by relevance MaxSim. The document and
-keypoint encoder share trainable parameters, so their representations can
-move together. Low alignment losses alone do not establish exact fact
-preservation.
+Coverage and keypoint matching anchor the student summaries to the fixed
+original embedding teacher's token directions. The target representations
+cannot move with the student. Both losses use cosine directions, which do
+not enforce the vector magnitudes used by relevance MaxSim. Low alignment
+losses alone do not establish exact fact preservation.
 
 ### 1.8 Joint optimization
 
@@ -700,13 +753,16 @@ Example starting weights for the revised theory are:
 | $\lambda_{\mathrm{keypoint}}$ | 1.0 | Strength of matching each document/keypoint pair |
 | $\lambda_{\mathrm{sparsity}}$ | 0.01 | Cost of summed gate mass across a document's chunks |
 
-The shared embedding table and document/keypoint backbone, query adapter,
+The student's shared embedding table and document backbone, query adapter,
 initial summary queries, cross-attention and self-attention layers, both
 FFNs per summary block, normalization layers, gating head, and score
-parameters $\alpha,b$ are optimized jointly. The keypoint branch introduces
-no independent encoder parameters. Teacher probabilities, keypoint text, and
-corpus-derived token weights remain fixed; keypoint token vectors are
-recomputed through the shared trainable encoder.
+parameters $\alpha,b$ are optimized jointly. The original embedding teacher
+is a separate model shared by the coverage-target and keypoint-target
+branches; its parameters are excluded from the optimizer. Teacher relevance
+probabilities, teacher token vectors $H_r^T$ and $U_f^T$, keypoint text, and
+corpus-derived token weights remain fixed. Recomputing token targets through
+the frozen teacher gives the same reference representations for the same
+inputs and encoding settings.
 
 BCE averages over valid query-document examples. Coverage averages over
 unique chunks, keypoint loss over unique document/keypoint pairs, and
@@ -755,12 +811,15 @@ independently on every chunk before compression. Each summary block adds
 cross-attention interactions costing $O(MCd)$ and summary self-attention
 interactions costing $O(M^2d)$ per chunk, in addition to projections and
 FFNs. Across $L$ blocks and $J_D$ chunks, those interaction costs are
-$O(LJ_D(MC+M^2)d)$. Training also retains uncompressed chunk states and
-computes an $\ell_r\times M$ cosine-distance matrix per chunk for coverage.
-Keypoint supervision adds a full encoder pass for each distinct $(D,f)$
+$O(LJ_D(MC+M^2)d)$. Training also computes an $\ell_r\times M$
+cosine-distance matrix per chunk against frozen teacher states for coverage.
+Obtaining these states adds an original embedding teacher pass per unique
+chunk. Keypoint supervision adds a teacher pass for each distinct $(D,f)$
 pair and an $L_f\times(J_DM)$ cosine-similarity matrix for its document.
-These keypoint computations are needed during training; serving query-document
-scores does not require the keypoint branch.
+Teacher passes need no backward activations, and their outputs can be cached
+to trade storage for repeated computation. Online target generation requires
+memory for a separate frozen teacher in addition to the trainable student.
+Serving query-document scores requires neither teacher nor keypoint branch.
 
 The intended serving advantage comes from compressing chunks in advance
 and encoding a query once for many candidate documents. Chunking bounds
@@ -770,9 +829,13 @@ counts establish a deployment latency.
 
 ## Part 2: Implementation
 
-The code implements the four-loss objective in Part 1. Configuration and
-saved data from the earlier margin/Chamfer model need migration before a
-new training run.
+The code implements the four loss forms, but **does not yet implement the
+original embedding teacher target sources specified in Part 1**. Coverage
+currently uses trainable student chunk states, and keypoints run through the
+same trainable backbone. The sections below describe the checked-in code and
+identify the required changes in Sections 2.7 and 2.8. Configuration and saved
+data from the earlier margin/Chamfer model also need migration before a new
+training run.
 
 ### 2.1 Repository structure and responsibilities
 
@@ -954,8 +1017,9 @@ path, including when that negative type is absent.
 
 ### 2.7 Model interfaces and summary extraction
 
-The backbone is shared by document chunks, keypoint encoding, and the query
-embedding lookup. No frozen keypoint model is created. The loader uses SDPA,
+In the current code, the backbone is shared by document chunks, keypoint
+encoding, and the query embedding lookup. No frozen embedding teacher is
+created. The student loader uses SDPA,
 padding-only bidirectional attention, and no cache. The patch depends on
 the Qwen3 attention interface supported by the installed Transformers version.
 
@@ -966,7 +1030,7 @@ document tensors:
 
 | Output key | Shape | Theory / use |
 |---|---|---|
-| `h_d` | $(N_c,C,d)$ | Contextualized chunk tokens for coverage |
+| `h_d` | $(N_c,C,d)$ | Student chunk tokens $H_r$; currently also used for coverage |
 | `doc_attention_mask` | $(N_c,C)$ | Real-token mask |
 | `b_d` | $(N_c,M,d)$ | Ungated $S_r$, used by coverage |
 | `pi` | $(N_c,M)$ | Continuous gates |
@@ -981,6 +1045,17 @@ and chunks them internally. Already chunked inputs can supply
 `chunk_doc_index` and `num_documents` explicitly. `encode_keypoint` runs
 the whole keypoint through the same backbone. `encode_query` uses the
 shared embedding lookup and shallow adapter.
+
+To implement Part 1, load a separate $E_{\mathrm{emb}}^0$ from the original
+embedding checkpoint, retain its original encoding behavior, freeze every
+parameter, and keep it in evaluation mode even while the student trains.
+Run it without gradient recording on the aligned chunk inputs and whole
+keypoints. Return a separate detached `teacher_h_d` tensor with shape
+$(N_c,C,d)$ for $H_r^T$, and make `keypoint_vectors` contain detached
+$U_f^T$. Keep `h_d` as the student's compressor input. Detaching the current
+`h_d` or sharing the student's changing weights would not supply the fixed
+original teacher targets. Existing token IDs and masks can be reused because
+the student and original teacher use the same tokenizer and vector width.
 
 For whole-document `maxsim(q, b, summary_mask)`, use `document_vectors` and
 its mask. The maximum spans every real chunk before summing query slots.
@@ -1009,8 +1084,14 @@ ordinary negatives, then hard negatives. `forward_batch_and_loss` computes:
 Cosine matrices use float32 with autocast disabled and epsilon-safe norms.
 Zero-total-weight chunks contribute zero coverage and remain in the chunk
 average. `keypoint_doc_index` selects each keypoint's document summaries
-and validity mask. Keypoint vectors retain gradients through the shared
-encoder.
+and validity mask. In the current code, both `h_d` and keypoint vectors retain
+gradients through the shared student encoder; this differs from Part 1.
+The required change is to pass `doc_out["teacher_h_d"]` to coverage and
+frozen teacher `keypoint_vectors` to keypoint matching. These targets must
+have no gradient path, while student summaries retain their gradient graph.
+Exclude the embedding teacher from optimization, preserve its evaluation
+mode, and record the original checkpoint revision and encoding settings for
+reproducibility or cache validation.
 The requested keypoint score retains the positive-gate cancellation
 described in Part 1.
 
@@ -1033,7 +1114,9 @@ full training resume is not implemented.
 
 ### 2.9 Run training and score a complete document
 
-With dependencies installed and input data available:
+With dependencies installed and input data available, these commands run the
+current implementation. The frozen target-source changes in Sections 2.7
+and 2.8 are required before training the revised design in Part 1:
 
 ```bash
 # When using the existing upstream sources, build joined query rows.
@@ -1126,3 +1209,10 @@ chunk retention, masks, teacher probabilities, loss reductions, and gradients
 without downloading pretrained weights. Full pretrained-model training,
 ranking evaluation, persistent indexing, hard pruning, quantization, export,
 and measured edge latency remain separate work.
+
+Existing tests do not establish the revised frozen embedding teacher behavior.
+When implementing it, verify that both target branches use the original
+checkpoint, teacher outputs have no gradients, teacher weights remain
+unchanged after an optimizer step, and alignment losses still backpropagate
+through student summaries. Validate token/mask/IDF alignment and that the
+student's training mode and attention patch do not alter teacher behavior.
