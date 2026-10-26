@@ -16,7 +16,8 @@ Existing commands still run the earlier model described in the status table.
 | Embedding backbone | `Qwen/Qwen3-Embedding-0.6B`, native width 1024 | `Qwen/Qwen3-Embedding-0.6B`, width 1024 |
 | Encoder training | Frozen backbone and input embedding table; evaluation mode; no gradient recording | Shared backbone is optimized with the other model parameters |
 | Coverage reference | Reuse the same frozen encoder's contextual token states | Current coverage uses trainable student token states |
-| Summary count | 64 slots per chunk before post-training selection | 32 slots per chunk |
+| Chunk size | 2048 tokens; complete documents split into chunks | 1024 tokens per chunk |
+| Summary count | 128 slots per chunk before post-training selection | 32 slots per chunk |
 | Keypoints | Additional positive queries through the ordinary query path | Separate full-backbone keypoint encoding and matching loss |
 | Query length | 64 token slots for all query types, including keypoints | 32 slots for ordinary queries; full-length keypoints in a separate encoder branch |
 | Encoder attention | Native pretrained attention behavior | Bidirectional attention patch |
@@ -67,7 +68,8 @@ The following are target requirements, not a runnable replacement YAML:
 | Backbone name | `Qwen/Qwen3-Embedding-0.6B` |
 | Hidden width | 1024 throughout the query adapter, summary blocks, normalization, and scoring |
 | Backbone freeze | All backbone parameters, including the shared input embedding table |
-| Summary capacity | `model.num_summary_tokens: 64` per chunk |
+| Chunk size | `model.doc_chunk_size: 2048` tokens |
+| Summary capacity | `model.num_summary_tokens: 128` per chunk |
 | Query slots | `model.query_max_len: 64` for ordinary queries and keypoints |
 | Query adapter structure | Retain `n_query_adapter_layers: 2` and `n_query_adapter_heads: 8` |
 | Compressor structure | Retain `n_cross_attn_layers: 1` complete refinement block and `n_cross_attn_heads: 8` for its cross-attention and self-attention |
@@ -78,9 +80,9 @@ The following are target requirements, not a runnable replacement YAML:
 | Encoder attention | Native pretrained attention; remove the bidirectional patch from this path |
 | Post-training thresholds | `0, 0.25, 0.5, 0.75, 0.9` |
 
-The chunk size remains 1024 tokens; query length becomes 64 slots. These are
-separate from vector width and summary count. A 64-vector budget does not
-imply a 64-dimensional representation. The 0.6B checkpoint's
+The chunk size becomes 2048 tokens; query length is 64 slots. These are
+separate from vector width and summary count. A 128-vector budget does not
+imply a 128-dimensional representation. The 0.6B checkpoint's
 [official configuration](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B/blob/main/config.json)
 specifies the native hidden width of 1024.
 
@@ -88,11 +90,13 @@ specifies the native hidden width of 1024.
 fields require corresponding dataclass support; adding invented keys to YAML
 is insufficient. The current YAML overrides the Python epoch default from
 three to five. Current optimizer and batch defaults have not been tuned for
-the revised frozen-encoder training setup and 64-summary budget.
+the revised frozen-encoder training setup, 2048-token chunks, and 128-summary
+budget.
 
 The checkpoint and width already match the checked-in 0.6B configuration.
 The migration still requires freezing the encoder, restoring native attention,
-and changing the summary budget from 32 gated slots to 64 direct vectors.
+increasing chunk size from 1024 to 2048 tokens, and changing the summary
+budget from 32 gated slots to 128 direct vectors.
 Measure device memory and latency before choosing a batch size.
 
 ## 3. Load and freeze one shared embedding encoder
@@ -276,14 +280,14 @@ states and compressed summary vectors.
 The [architecture diagram](compression.md#2-query-encoding-and-document-scoring)
 shows these blocks at the revised dimensions. Retain the existing block
 structures and 1024-wide hidden states while updating freezing behavior
-and the query and summary budgets:
+and the chunk, query, and summary budgets:
 
 | Component | Revised architecture |
 |---|---|
 | Query lookup | Frozen shared embedding table; `(B, 64)` IDs become `(B, 64, 1024)` vectors |
 | Query adapter | Two pre-norm Transformer encoder layers; eight self-attention heads per layer; FFN width 4096, GELU, dropout 0 |
 | Query output | `LayerNorm(X_Q + F_Q(X_Q))`; includes an outer residual in addition to each layer's internal residuals |
-| Summary initialization | One trainable `(64, 1024)` matrix, reused for every chunk |
+| Summary initialization | One trainable `(128, 1024)` matrix, reused for every chunk |
 | Summary block | One block by default: cross-attention, FFN1, self-attention, FFN2; eight heads in both attention modules; pre-norm and a residual at each stage |
 | Compressor FFNs | Separate `Linear(1024, 4096) -> GELU -> Linear(4096, 1024)` networks; dropout 0 |
 | Document scoring | Concatenate chunk summaries; form query-to-summary scaled dot products; take the maximum per query slot and sum all 64 maxima |
@@ -303,15 +307,15 @@ unique documents, and `Jmax` the maximum chunk count in a document batch.
 
 | Output | Shape | Revised meaning |
 |---|---|---|
-| `h_d` | `(Nc, 1024, 1024)` | Detached frozen encoder states, reused for coverage |
-| `doc_attention_mask` | `(Nc, 1024)` | Real token mask, including the final partial chunk |
-| `b_d` | `(Nc, 64, 1024)` | Direct trainable summary vectors |
+| `h_d` | `(Nc, 2048, 1024)` | Detached frozen encoder states, reused for coverage |
+| `doc_attention_mask` | `(Nc, 2048)` | Real token mask, including the final partial chunk |
+| `b_d` | `(Nc, 128, 1024)` | Direct trainable summary vectors |
 | `chunk_doc_index` | `(Nc,)` | Chunk owner in the unique-document table |
-| `document_vectors` | `(U, Jmax * 64, 1024)` | Concatenated direct summaries with packing padding |
-| `document_summary_mask` | `(U, Jmax * 64)` | Valid summary positions before selection |
+| `document_vectors` | `(U, Jmax * 128, 1024)` | Concatenated direct summaries with packing padding |
+| `document_summary_mask` | `(U, Jmax * 128)` | Valid summary positions before selection |
 
-Each chunk produces 64 vectors. A document with `J` chunks therefore has
-`J * 64` vectors before post-training selection. Select separately within
+Each chunk produces 128 vectors. A document with `J` chunks therefore has
+`J * 128` vectors before post-training selection. Select separately within
 each chunk, then concatenate its retained vectors with those of the other
 chunks. Keep original chunk and slot IDs in selected caches.
 
@@ -363,17 +367,17 @@ gap, cutoff rule, and reference metadata.
 
 After training, compute summary coverage at `tau = 0, 0.25, 0.5, 0.75, 0.9`.
 For each chunk and threshold, count the real tokens whose cosine similarity
-with each summary is at least `tau`. Sort the 64 counts descending, breaking
-ties by original slot ID. Evaluate the 63 adjacent drops in that sorted
+with each summary is at least `tau`. Sort the 128 counts descending, breaking
+ties by original slot ID. Evaluate the 127 adjacent drops in that sorted
 list; a cutoff after position `p` retains the first `p` vectors.
 
 Choose the largest drop across all thresholds and cutoff positions for that
 chunk. Ties retain the most vectors, then choose the lowest threshold. If
-every drop at every threshold is zero, retain all 64 vectors and record
+every drop at every threshold is zero, retain all 128 vectors and record
 `tau = 0`. Concatenate the retained vectors across document chunks. There
 is no trained gate or sparsity objective to consult. See
 [evaluation.md](evaluation.md) for equations and reporting. Report the full
-baseline of 64 vectors per chunk alongside selected representations.
+baseline of 128 vectors per chunk alongside selected representations.
 
 ## 8. Commands and validation
 

@@ -3,7 +3,8 @@
 This is the evaluation specification for the revised design in
 [`compression.md`](compression.md). The encoder is a frozen
 `Qwen/Qwen3-Embedding-0.6B` with width 1,024, including its input embedding table.
-The compressor produces 64 summary vectors per chunk before postprocessing.
+The compressor produces 128 summary vectors per 2048-token chunk before
+postprocessing.
 Training keeps soft-target BCE and IDF-weighted coverage, with no InfoNCE,
 gating, or sparsity objective. Keypoints are queries alongside direct and
 indirect queries; there is no separate keypoint matching loss.
@@ -22,7 +23,8 @@ Record the following before evaluating a checkpoint:
 | Compressor | Checkpoint, architecture version, effective configuration, tokenizer |
 | Frozen encoder | `Qwen/Qwen3-Embedding-0.6B`, exact revision, 1,024-dimensional output layer |
 | Encoding behavior | Native pretrained attention, preprocessing, chunk size, masks, precision |
-| Vector budget | 64 per chunk before selection |
+| Chunk size | 2048 tokens; complete document bodies are split without truncation |
+| Vector budget | 128 per chunk before selection |
 | Candidates | Stable unique `doc_id` values and complete document bodies |
 | Queries | `query_id`, text, type, source document, all labeled relevant document IDs |
 | Sampling | Seed, document count, query count per document and query type |
@@ -70,14 +72,14 @@ reranker teacher supplies relevance probabilities; it does not supply these
 token references.
 
 Retain original summary-slot IDs and document/chunk ownership before any
-selection. Each chunk owns 64 original summaries. Summary vectors are used
+selection. Each chunk owns 128 original summaries. Summary vectors are used
 directly: no learned gate scales them. A document with $J_D$ chunks therefore
-has $64J_D$ vectors before selection.
+has $128J_D$ vectors before selection.
 
 ## Match tokens and summaries at each threshold
 
 A matching group $g$ is one chunk: compare its real token positions with
-its own 64 original summaries. Compute selection and coverage independently
+its own 128 original summaries. Compute selection and coverage independently
 for each chunk. Do not match a token with summaries from another chunk, even
 when both chunks belong to the same document.
 
@@ -114,14 +116,14 @@ unweighted token counts, separate from IDF-weighted training coverage.
 ### Postprocessing selection by the largest gap
 
 Apply the following rule independently to each chunk $g$. At every threshold
-$\tau$, sort all 64 original slots by descending $n_{g,k}(\tau)$, breaking
+$\tau$, sort all 128 original slots by descending $n_{g,k}(\tau)$, breaking
 equal-count ties by ascending original slot ID. Let $a_{g,\tau,p}$ be the
 original slot ID at one-based sorted position $p$ and $v_{g,\tau,p}$ its count.
-Define the 63 adjacent drops by
+Define the 127 adjacent drops by
 
 $$
 \Delta_{g,\tau,p}=v_{g,\tau,p}-v_{g,\tau,p+1},
-\qquad p=1,\ldots,63.
+\qquad p=1,\ldots,127.
 $$
 
 For each threshold, find its largest drop. If several positions have that
@@ -145,7 +147,7 @@ When the winning drop is positive, retain exactly the sorted prefix
 $\mathcal K_g=\{a_{g,\tau_g^*,1},\ldots,
 a_{g,\tau_g^*,p_{g,\tau_g^*}}\}$. The cutoff is the boundary between positions
 $p_{g,\tau_g^*}$ and $p_{g,\tau_g^*}+1$; record both adjacent counts. If **all**
-gaps at **all** thresholds are zero, keep all 64 slots, record $\tau_g^*=0$,
+gaps at **all** thresholds are zero, keep all 128 slots, record $\tau_g^*=0$,
 and record no cutoff. This rule always retains at least one vector per chunk.
 
 Equivalent pseudocode, with one-based positions and stable original IDs:
@@ -154,11 +156,11 @@ Equivalent pseudocode, with one-based positions and stable original IDs:
 for tau in [0, .25, .5, .75, .9]:
     counts = number of real tokens with cosine(token, slot) >= tau, per slot
     order[tau] = sort original slots by (-counts[slot], original_slot_id)
-    gaps[p] = counts[order[tau][p]] - counts[order[tau][p + 1]], p = 1..63
+    gaps[p] = counts[order[tau][p]] - counts[order[tau][p + 1]], p = 1..127
     drop[tau] = max(gaps)
     prefix[tau] = largest p where gaps[p] == drop[tau]
 if max(drop.values()) == 0:
-    return all 64 original slots, selected_tau=0, cutoff=null
+    return all 128 original slots, selected_tau=0, cutoff=null
 chosen_tau = argmax_tau (drop[tau], prefix[tau], -tau)
 return order[chosen_tau][1..prefix[chosen_tau]], selected_tau=chosen_tau
 ```
@@ -174,7 +176,7 @@ Concatenate the retained vectors from all chunks in original chunk/slot order.
 Remove discarded vectors physically or mask them to negative infinity in
 MaxSim. Do not replace discarded vectors or packing padding with zeros: a
 zero could beat a valid negative score. Combine selection and padding masks
-using the correct document ownership. Include all 64 slots per chunk as
+using the correct document ownership. Include all 128 slots per chunk as
 the unselected baseline; neither representation has a gate multiplier.
 
 ## Rank candidates for direct, indirect, and keypoint queries

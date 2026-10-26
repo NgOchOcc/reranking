@@ -15,13 +15,13 @@ training code.
 Let $E_0$ be the frozen embedding encoder, including its input embedding
 table. Its native hidden-state width is $d=1024$, as specified in the
 [official checkpoint configuration](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B/blob/main/config.json).
-The number of summary vectors is separate from their width: **64 vectors
-does not mean 64-dimensional vectors**.
+The number of summary vectors is separate from their width: **128 vectors
+does not mean 128-dimensional vectors**.
 
-Split the complete document into nonoverlapping chunks of $C=1024$ tokens.
+Split the complete document into nonoverlapping chunks of $C=2048$ tokens.
 Only the final chunk is padded; discard no real tokens. Each chunk produces
-**$M=64$ summary vectors**, each with 1024 components. A document with $J_D$
-chunks therefore has $64J_D$ vectors before post-training selection.
+**$M=128$ summary vectors**, each with 1024 components. A document with $J_D$
+chunks therefore has $128J_D$ vectors before post-training selection.
 
 For chunk $C_r$ with $\ell_r$ real tokens, compute:
 
@@ -37,7 +37,7 @@ compressor inputs and the token-coverage reference. A second frozen encoder
 is unnecessary when both uses have the same tokenizer, chunk boundaries,
 attention behavior, and checkpoint revision.
 
-A shared learned matrix $Z^{(0)}\in\mathbb R^{64\times1024}$ initializes
+A shared learned matrix $Z^{(0)}\in\mathbb R^{128\times1024}$ initializes
 every chunk's summary slots. The compressor independently refines these
 slots against that chunk's $H_r$, producing $S_r$. All chunks share the same
 compressor parameters. Concatenate the results to represent a full document:
@@ -56,7 +56,7 @@ after training.
 
 ## 2. Query encoding and document scoring
 
-The architecture below shows the training path with all 64 summaries per
+The architecture below shows the training path with all 128 summaries per
 chunk. It retains the existing configurable defaults of two query-adapter
 layers, one summary-refinement block, and eight heads in each adapter or
 compressor attention module, using the revised width and token budgets.
@@ -73,19 +73,19 @@ flowchart TB
     end
 
     subgraph DOC["Document encoder and compressor: repeat independently per chunk"]
-        D["Full document"] --> CH["Split into 1024-token chunks"]
+        D["Full document"] --> CH["Split into 2048-token chunks"]
         CH --> ENC["Frozen Qwen3-Embedding-0.6B<br/>Native pretrained attention"]
         ENC --> H["Frozen contextual tokens H_r<br/>Real tokens x 1024"]
-        Z["Trainable initial summary queries<br/>64 x 1024"] -->|Queries| CA["Cross-attention + residual"]
+        Z["Trainable initial summary queries<br/>128 x 1024"] -->|Queries| CA["Cross-attention + residual"]
         H -->|Keys and values| CA
         CA --> FF1["FFN1 + residual"]
         FF1 --> SA["Summary self-attention + residual"]
-        SA --> FF2["FFN2 + residual<br/>Chunk summaries: 64 x 1024"]
-        FF2 --> CAT["Concatenate summaries from all chunks<br/>Document vectors: 64 J_D x 1024"]
+        SA --> FF2["FFN2 + residual<br/>Chunk summaries: 128 x 1024"]
+        FF2 --> CAT["Concatenate summaries from all chunks<br/>Document vectors: 128 J_D x 1024"]
     end
 
     subgraph SCORE["Document scoring"]
-        DOT["Scaled dot-product matrix<br/>64 x 64 J_D"] --> MAX["Maximum over document vectors<br/>64 best-match scores"]
+        DOT["Scaled dot-product matrix<br/>64 x 128 J_D"] --> MAX["Maximum over document vectors<br/>64 best-match scores"]
         MAX --> SUM["Sum over query slots<br/>Raw MaxSim score"]
         SUM --> CAL["Trainable positive scale and bias"]
         CAL --> P["Sigmoid relevance probability"]
@@ -108,14 +108,14 @@ shown in the diagram is additional to those internal residuals.
 
 In the compressor, cross-attention reads the frozen chunk tokens using the
 current summaries as queries. Summary self-attention exchanges information
-between the 64 slots. All four stages use pre-normalization and residual
+between the 128 slots. All four stages use pre-normalization and residual
 connections. Both compressor FFNs and the query-adapter FFNs use
 `Linear(1024, 4096) -> GELU -> Linear(4096, 1024)`; the two compressor FFNs
 have separate weights.
 
 After training, apply the coverage-based selection from Section 5 to each
 chunk's final summaries **before concatenation**. The scoring path then uses
-the retained document vectors instead of all $64J_D$ vectors.
+the retained document vectors instead of all $128J_D$ vectors.
 
 Formally, the query encoder computes:
 
@@ -218,7 +218,7 @@ counts documents containing the token. For $W_r>0$:
 $$
 \mathcal L_{\mathrm{cov}}(C_r)=
 \frac{\sum_{j=1}^{\ell_r}w_{r,j}
-\left[1-\max_{1\leq k\leq64}\cos(h_{r,j},s_{r,k})\right]}{W_r}.
+\left[1-\max_{1\leq k\leq128}\cos(h_{r,j},s_{r,k})\right]}{W_r}.
 $$
 
 A zero-weight chunk contributes zero. Average over unique chunks, including
@@ -250,17 +250,17 @@ A_{jk}=\cos(h_j,s_k),\qquad
 $$
 
 Apply the following rule **independently to each chunk**, always starting
-from its original 64 summaries:
+from its original 128 summaries:
 
 1. For each $\tau$, count each summary's matching real tokens:
    $n_k(\tau)=\sum_j\mathbf1[A_{jk}\geq\tau]$.
 2. Sort summaries by descending count, breaking equal counts by original
-   slot ID. For sorted counts $n_{(1)},\ldots,n_{(64)}$, calculate
-   $\Delta_p(\tau)=n_{(p)}(\tau)-n_{(p+1)}(\tau)$ for $p=1,\ldots,63$.
+   slot ID. For sorted counts $n_{(1)},\ldots,n_{(128)}$, calculate
+   $\Delta_p(\tau)=n_{(p)}(\tau)-n_{(p+1)}(\tau)$ for $p=1,\ldots,127$.
 3. Choose the threshold and cut position with the greatest gap. On ties,
    keep the most vectors (largest $p$), then choose the lowest $\tau$.
 4. Keep the first $p$ summaries. If every gap at every threshold is zero,
-   keep all 64 and record $\tau=0$ as the deterministic fallback.
+   keep all 128 and record $\tau=0$ as the deterministic fallback.
 
 Concatenate the retained vectors across the document's chunks. The cutoff
 can differ between chunks; it is not a fixed removal percentage. The

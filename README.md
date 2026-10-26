@@ -1,8 +1,8 @@
 # Latent Bottleneck Reranker
 
 The revised design uses a **frozen `Qwen/Qwen3-Embedding-0.6B` encoder with its
-native pretrained attention**. A trainable compressor produces **64 summary
-vectors per 1,024-token chunk**. Each vector has 1,024 components. Documents
+native pretrained attention**. A trainable compressor produces **128 summary
+vectors per 2,048-token chunk**. Each vector has 1,024 components. Documents
 are encoded independently of queries, allowing their summaries to be cached.
 
 Direct queries, indirect queries, and keypoints share a trainable query adapter
@@ -57,15 +57,15 @@ These are target settings, not the current contents of
 | Embedding encoder | `Qwen/Qwen3-Embedding-0.6B`, frozen including its input embedding table |
 | Encoder attention | Native pretrained behavior |
 | Hidden-state width | 1,024 |
-| Chunk size | 1,024 tokens, without whole-document truncation |
-| Summary count | 64 per chunk before selection |
+| Chunk size | 2,048 tokens, without whole-document truncation |
+| Summary count | 128 per chunk before selection |
 | Query limit | 64 tokens, including keypoints and negative queries |
 | Relevance teacher | `Qwen/Qwen3-Reranker-8B` |
 | Relevance loss | Soft-target BCE, coefficient 1 |
 | Token coverage loss | IDF-weighted cosine coverage, coefficient 1 |
 | Post-training cosine thresholds | `0, 0.25, 0.5, 0.75, 0.9` |
 
-Train with all 64 summary slots. After training, select vectors separately
+Train with all 128 summary slots. After training, select vectors separately
 within each chunk using the largest gap in sorted token-coverage counts
 across the five thresholds, then concatenate the retained vectors across
 the document. Compare with the unpruned baseline using
