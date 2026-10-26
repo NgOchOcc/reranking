@@ -1,14 +1,76 @@
 # Latent Bottleneck Reranker
 
-Compress every document into nonoverlapping 1,024-token chunks, with 32
-gated summary vectors per chunk. A shallow query adapter scores the entire
-document by MaxSim over all real chunk summaries. A learned positive scale
-and bias convert that score into a sigmoid relevance prediction.
+The revised design uses a **frozen `Qwen/Qwen3-Embedding-8B` encoder with its
+native pretrained attention**. A trainable compressor produces **256 summary
+vectors per 1,024-token chunk**. Each vector has 4,096 components. Documents
+are encoded independently of queries, allowing their summaries to be cached.
 
-The shared document/keypoint backbone is Qwen/Qwen3-Embedding-0.6B.
-The model trains jointly with soft-target BCE, normalized token coverage,
-keypoint matching, and summed-gate sparsity. The equations and detailed
-implementation are in [docs/compression.md](docs/compression.md).
+Direct queries, indirect queries, and keypoints share a trainable query adapter
+with a **64-token limit** and the encoder's frozen input embedding table.
+Document scores use MaxSim over all chunk summaries. Training combines only
+teacher soft-target BCE and IDF-weighted token coverage. There is no keypoint
+matching loss, gating head, or sparsity loss.
+
+**These documents specify the revised design. The checked-in Python code,
+scripts, and YAML still implement the earlier 0.6B model with 32 gated vectors
+per chunk and four losses.** Follow the implementation migration guide before
+running training for the revised design.
+
+## Documentation
+
+- [Compression theory](docs/compression.md): architecture, supervision, and the
+  two training losses.
+- [Implementation guide](docs/implementation.md): current code, required changes,
+  data preparation, tensor interfaces, and training artifacts.
+- [Evaluation](docs/evaluation.md): post-training vector selection, Precision@1,
+  Mean Reciprocal Rank (MRR), and token coverage.
+
+## Training supervision
+
+Use the existing document-linked keypoints and generated queries. Keypoints
+become positive queries for their source document, using the same query path
+as direct and indirect queries. Include all three pair types:
+
+| Pair | Purpose |
+|---|---|
+| `(positive query or keypoint, relevant document)` | Match relevant pairs |
+| `(positive query or keypoint, negative document)` | Distinguish candidate documents |
+| `(negative query, source document)` | Reject ordinary and hard-negative queries |
+
+The frozen `Qwen/Qwen3-Reranker-8B` supplies a separate, precomputed relevance
+probability for every selected pair. BCE matches those probabilities; pair
+labels guide sampling and do not replace the teacher targets with hard labels.
+Exclude duplicate bodies and known relevant documents from negative-document
+sampling. Preserve full-document teacher provenance and mask unavailable targets.
+
+Coverage uses the frozen encoder's own contextual token vectors, so a second
+embedding-model copy is unnecessary. Encode each unique document once per batch
+and compute its chunk coverage once, regardless of how many queries reference it.
+
+## Revised configuration targets
+
+These are target settings, not the current contents of
+[configs/default.yaml](configs/default.yaml):
+
+| Setting | Revised value |
+|---|---|
+| Embedding encoder | `Qwen/Qwen3-Embedding-8B`, frozen including its input embedding table |
+| Encoder attention | Native pretrained behavior |
+| Hidden-state width | 4,096 |
+| Chunk size | 1,024 tokens, without whole-document truncation |
+| Summary count | 256 per chunk before selection |
+| Query limit | 64 tokens, including keypoints and negative queries |
+| Relevance teacher | `Qwen/Qwen3-Reranker-8B` |
+| Relevance loss | Soft-target BCE, coefficient 1 |
+| Token coverage loss | IDF-weighted cosine coverage, coefficient 1 |
+| Post-training cosine thresholds | `0, 0.25, 0.5, 0.75, 0.9` |
+
+Train with all 256 summary slots. After training, select vectors separately
+within each chunk using the largest gap in sorted token-coverage counts
+across the five thresholds, then concatenate the retained vectors across
+the document. Compare with the unpruned baseline using
+Precision@1, MRR, token coverage, and retained-vector counts. Validate the
+selection procedure before evaluating the held-out test set.
 
 ## Environment
 
@@ -18,168 +80,7 @@ Use Python 3.10 or newer and install the core dependencies:
 python -m pip install -r requirements.txt
 ```
 
-The Qwen3 bidirectional attention adapter is tested with Transformers
-4.52.3, which is pinned in the requirements. Full training needs access to
-the student backbone and the prepared training data. Teacher precomputation
-separately loads the 8B reranker.
-
-Optional inspection plots use `matplotlib`; BEIR sampling uses
-`datasets`. The tests use tiny local models and require no model downloads.
-
-## Training data and keypoints
-
-Each scored JSONL row retains the existing query fields:
-
-```json
-{
-  "doc_id": "doc-001",
-  "body": "The full document, including all chunks.",
-  "keypoint": "The fact that generated this row's queries.",
-  "direct_query": "A direct query",
-  "indirect_query": "An indirect query",
-  "negative_queries": ["An ordinary negative query"],
-  "hard_negative_queries": ["A hard negative query"],
-  "teacher_scores": {
-    "direct": 0.94,
-    "indirect": 0.87,
-    "negative_queries": [0.03],
-    "hard_negative_queries": [0.18]
-  },
-  "teacher_metadata": {
-    "document_scope": "full_document",
-    "source": "external full-document teacher",
-    "policy": "Judge the complete document for each query"
-  }
-}
-```
-
-The numbers and text above illustrate the schema. Target arrays must match
-the corresponding query arrays, and every target must be finite and in
-[0, 1]. Direct and indirect queries each receive their own soft target.
-
-Use the existing `keypoint` on each row. A document can have several rows
-with different keypoints; repeated document IDs must agree on the body.
-Within a batch, documents are encoded once per `doc_id`, and keypoints are
-encoded once per distinct `(doc_id, keypoint)` pair. Each keypoint matches
-against all summaries of its associated document.
-
-## Prepare and train
-
-```bash
-# 1. Join existing canonical bodies, queries, and negative queries.
-./scripts/run_build_index.sh
-
-# 2. Build nonnegative IDF weights from complete original documents.
-./scripts/run_build_idf.sh
-
-# 3. Score complete query-document pairs with the discriminative teacher.
-./scripts/run_precompute_teacher.sh
-
-# 4. Train the student with all four losses.
-./scripts/run_train.sh
-```
-
-The joiner consumes the existing upstream JSONL sources; keypoint and query
-generation remain external. Teacher precomputation preserves each row's
-existing `keypoint` field.
-
-Teacher targets describe whole documents, after all their chunk summaries
-are combined by the student. The teacher wrapper refuses prompts beyond its
-configured context budget instead of truncating them. Its default total
-prompt budget is 32,768 tokens, including query, instructions, and special
-tokens. Documents beyond that budget need targets from an explicitly
-defined long-document teacher policy. The teacher's
-[official model card](https://huggingface.co/Qwen/Qwen3-Reranker-8B)
-describes its relevance scoring and supported context.
-
-Generated scores include `teacher_metadata` identifying the model,
-instruction, context budget, and full-document scope. Training rejects
-missing full-document provenance and inconsistent teacher settings. For
-external targets, record their full-document scope and source/policy as
-illustrated above. Prefix-only targets must be regenerated; changing their
-metadata does not make them full-document judgments.
-
-## Model and loss configuration
-
-Key settings in [configs/default.yaml](configs/default.yaml):
-
-| Setting | Default |
-|---|---|
-| `model.doc_chunk_size` | 1024 tokens |
-| `model.num_summary_tokens` | 32 per chunk |
-| `model.n_cross_attn_layers` | 1 complete summary-refinement block |
-| `model.query_max_len` | 32 query slots |
-| `loss.lambda_coverage` | 1.0 |
-| `loss.lambda_keypoint` | 1.0 |
-| `loss.lambda_sparsity` | 0.01 |
-
-Each refinement block performs pre-norm residual cross-attention, FFN1,
-summary self-attention, and FFN2. Every document token is retained in a
-chunk; only the last chunk is padded.
-
-The training components are:
-
-- **BCE:** match each teacher probability with
-  `sigmoid(softplus(score_alpha) * MaxSim + score_bias)`.
-- **Coverage:** within each chunk, average nearest-summary cosine distances
-  with weights `log((N + 1) / (df + 1))`, normalized by their total mass.
-  A zero-total-weight chunk contributes zero.
-- **Keypoint:** encode every keypoint token with the shared full backbone;
-  use one minus the mean tokenwise maximum cosine against all gated
-  document summaries. This branch has no pooling or query-length truncation.
-- **Sparsity:** sum gates over all chunks of each document, then average
-  over unique documents.
-
-Coverage averages over unique chunks, keypoint loss over distinct
-`(doc_id, keypoint)` pairs, and sparsity over unique documents. Repeating
-the same document/keypoint pair does not repeat its keypoint loss.
-Missing negative queries and padded document summary slots are masked.
-Cosine calculations run in float32, including under bf16 autocast.
-
-Positive gate scaling cancels inside cosine away from its epsilon floor.
-Consequently, the requested keypoint objective aligns summary directions
-without directly resisting gate shrinkage. Soft gating also retains every
-slot physically; pruning and a persistent serving index are separate work.
-
-## Inference
-
-After loading a model and its corresponding tokenizer:
-
-```python
-import torch
-
-from src.data.dataset import pad_query_ids
-
-# model is a LatentBottleneckReranker loaded with the run's config/checkpoint.
-model.eval()
-device = next(model.parameters()).device
-document_inputs = tokenizer(
-    document_text, add_special_tokens=False, truncation=False,
-    return_tensors="pt",
-).to(device)
-mask_id = tokenizer.convert_tokens_to_ids(model.cfg.mask_token)
-query_ids = torch.tensor([
-    pad_query_ids(tokenizer, query_text, model.cfg.query_max_len, mask_id)
-], device=device)
-
-with torch.no_grad():
-    document = model.encode_document(**document_inputs)
-    query = model.encode_query(query_ids)
-    score = model.maxsim(
-        query, document["document_vectors"], document["document_summary_mask"]
-    )
-    probability = model.scores_to_probabilities(score)
-```
-
-`encode_document` automatically chunks full document input rows.
-`document_vectors` and `document_summary_mask` are the packed
-whole-document representation. The older output names `h_d`, `b_d`,
-`pi`, and `b_d_tilde` remain **chunkwise** for coverage and diagnostics.
-In theory notation, `b_d` is ungated $S_r$ and `b_d_tilde` is gated
-$B_r$. Reuse packed document vectors across queries when caching them.
-Keypoint text is needed for training, not for serving.
-
-Training writes `checkpoint-<step>.pt`, `final_model.pt`,
-`config.yaml`, tokenizer files, `metrics.csv`, and TensorBoard logs.
-Weight files contain the full model state, including calibration parameters.
-They do not resume optimizer or scheduler state.
+The existing tests use tiny local models without downloading pretrained
+weights. They validate the earlier implementation; they do not establish
+correctness of the revised design. The implementation guide lists the
+required migration checks and identifies existing pipeline entrypoints.
