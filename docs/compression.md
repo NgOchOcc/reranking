@@ -1,7 +1,7 @@
 # Latent Bottleneck Compression
 
 This design learns a compact, query-independent representation of a document.
-A frozen `Qwen/Qwen3-Embedding-8B` encoder supplies contextual token vectors;
+A frozen `Qwen/Qwen3-Embedding-0.6B` encoder supplies contextual token vectors;
 a trainable compressor turns them into summary vectors. Queries and keypoints
 learn to retrieve the right documents through the same query path.
 
@@ -13,21 +13,21 @@ training code.
 ## 1. Frozen features and trainable summaries
 
 Let $E_0$ be the frozen embedding encoder, including its input embedding
-table. Its native hidden-state width is $d=4096$, as specified in the
-[official checkpoint configuration](https://huggingface.co/Qwen/Qwen3-Embedding-8B/blob/main/config.json).
-The number of summary vectors is separate from their width: **256 vectors
-does not mean 256-dimensional vectors**.
+table. Its native hidden-state width is $d=1024$, as specified in the
+[official checkpoint configuration](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B/blob/main/config.json).
+The number of summary vectors is separate from their width: **64 vectors
+does not mean 64-dimensional vectors**.
 
 Split the complete document into nonoverlapping chunks of $C=1024$ tokens.
 Only the final chunk is padded; discard no real tokens. Each chunk produces
-**$M=256$ summary vectors**, each with 4096 components. A document with $J_D$
-chunks therefore has $256J_D$ vectors before post-training selection.
+**$M=64$ summary vectors**, each with 1024 components. A document with $J_D$
+chunks therefore has $64J_D$ vectors before post-training selection.
 
 For chunk $C_r$ with $\ell_r$ real tokens, compute:
 
 $$
 H_r=\operatorname{stopgrad}(E_0(C_r))
-\in\mathbb R^{\ell_r\times4096}.
+\in\mathbb R^{\ell_r\times1024}.
 $$
 
 Keep the encoder in evaluation mode with gradient recording disabled.
@@ -37,7 +37,7 @@ compressor inputs and the token-coverage reference. A second frozen encoder
 is unnecessary when both uses have the same tokenizer, chunk boundaries,
 attention behavior, and checkpoint revision.
 
-A shared learned matrix $Z^{(0)}\in\mathbb R^{256\times4096}$ initializes
+A shared learned matrix $Z^{(0)}\in\mathbb R^{64\times1024}$ initializes
 every chunk's summary slots. The compressor independently refines these
 slots against that chunk's $H_r$, producing $S_r$. All chunks share the same
 compressor parameters. Concatenate the results to represent a full document:
@@ -56,7 +56,7 @@ after training.
 
 ## 2. Query encoding and document scoring
 
-The architecture below shows the training path with all 256 summaries per
+The architecture below shows the training path with all 64 summaries per
 chunk. It retains the existing configurable defaults of two query-adapter
 layers, one summary-refinement block, and eight heads in each adapter or
 compressor attention module, using the revised width and token budgets.
@@ -65,27 +65,27 @@ compressor attention module, using the revised width and token budgets.
 flowchart TB
     subgraph QUERY["Query encoder: direct, indirect, negative, or keypoint"]
         QID["Query token IDs: 64 slots"] --> EMB["Frozen shared input embedding table"]
-        EMB --> XQ["Input vectors X_Q: 64 x 4096"]
+        EMB --> XQ["Input vectors X_Q: 64 x 1024"]
         XQ --> FQ["Trainable query adapter F_Q<br/>2 pre-norm Transformer layers"]
         XQ --> ADD["Add outer residual"]
         FQ --> ADD
-        ADD --> QLN["Trainable LayerNorm<br/>Query vectors: 64 x 4096"]
+        ADD --> QLN["Trainable LayerNorm<br/>Query vectors: 64 x 1024"]
     end
 
     subgraph DOC["Document encoder and compressor: repeat independently per chunk"]
         D["Full document"] --> CH["Split into 1024-token chunks"]
-        CH --> ENC["Frozen Qwen3-Embedding-8B<br/>Native pretrained attention"]
-        ENC --> H["Frozen contextual tokens H_r<br/>Real tokens x 4096"]
-        Z["Trainable initial summary queries<br/>256 x 4096"] -->|Queries| CA["Cross-attention + residual"]
+        CH --> ENC["Frozen Qwen3-Embedding-0.6B<br/>Native pretrained attention"]
+        ENC --> H["Frozen contextual tokens H_r<br/>Real tokens x 1024"]
+        Z["Trainable initial summary queries<br/>64 x 1024"] -->|Queries| CA["Cross-attention + residual"]
         H -->|Keys and values| CA
         CA --> FF1["FFN1 + residual"]
         FF1 --> SA["Summary self-attention + residual"]
-        SA --> FF2["FFN2 + residual<br/>Chunk summaries: 256 x 4096"]
-        FF2 --> CAT["Concatenate summaries from all chunks<br/>Document vectors: 256 J_D x 4096"]
+        SA --> FF2["FFN2 + residual<br/>Chunk summaries: 64 x 1024"]
+        FF2 --> CAT["Concatenate summaries from all chunks<br/>Document vectors: 64 J_D x 1024"]
     end
 
     subgraph SCORE["Document scoring"]
-        DOT["Scaled dot-product matrix<br/>64 x 256 J_D"] --> MAX["Maximum over document vectors<br/>64 best-match scores"]
+        DOT["Scaled dot-product matrix<br/>64 x 64 J_D"] --> MAX["Maximum over document vectors<br/>64 best-match scores"]
         MAX --> SUM["Sum over query slots<br/>Raw MaxSim score"]
         SUM --> CAL["Trainable positive scale and bias"]
         CAL --> P["Sigmoid relevance probability"]
@@ -108,14 +108,14 @@ shown in the diagram is additional to those internal residuals.
 
 In the compressor, cross-attention reads the frozen chunk tokens using the
 current summaries as queries. Summary self-attention exchanges information
-between the 256 slots. All four stages use pre-normalization and residual
+between the 64 slots. All four stages use pre-normalization and residual
 connections. Both compressor FFNs and the query-adapter FFNs use
-`Linear(4096, 16384) -> GELU -> Linear(16384, 4096)`; the two compressor FFNs
+`Linear(1024, 4096) -> GELU -> Linear(4096, 1024)`; the two compressor FFNs
 have separate weights.
 
 After training, apply the coverage-based selection from Section 5 to each
 chunk's final summaries **before concatenation**. The scoring path then uses
-the retained document vectors instead of all $256J_D$ vectors.
+the retained document vectors instead of all $64J_D$ vectors.
 
 Formally, the query encoder computes:
 
@@ -168,8 +168,7 @@ negative-document supervision as other positive queries.
 
 ## 4. Training objective
 
-**Teacher BCE is the only relevance loss.** There is no InfoNCE or separate
-contrastive objective. For every selected pair, including keypoint queries
+**Teacher BCE is the only relevance loss.**. For every selected pair, including keypoint queries
 and other-document pairs, the frozen `Qwen/Qwen3-Reranker-8B` supplies a
 precomputed relevance target:
 
@@ -219,7 +218,7 @@ counts documents containing the token. For $W_r>0$:
 $$
 \mathcal L_{\mathrm{cov}}(C_r)=
 \frac{\sum_{j=1}^{\ell_r}w_{r,j}
-\left[1-\max_{1\leq k\leq256}\cos(h_{r,j},s_{r,k})\right]}{W_r}.
+\left[1-\max_{1\leq k\leq64}\cos(h_{r,j},s_{r,k})\right]}{W_r}.
 $$
 
 A zero-weight chunk contributes zero. Average over unique chunks, including
@@ -251,17 +250,17 @@ A_{jk}=\cos(h_j,s_k),\qquad
 $$
 
 Apply the following rule **independently to each chunk**, always starting
-from its original 256 summaries:
+from its original 64 summaries:
 
 1. For each $\tau$, count each summary's matching real tokens:
    $n_k(\tau)=\sum_j\mathbf1[A_{jk}\geq\tau]$.
 2. Sort summaries by descending count, breaking equal counts by original
-   slot ID. For sorted counts $n_{(1)},\ldots,n_{(256)}$, calculate
-   $\Delta_p(\tau)=n_{(p)}(\tau)-n_{(p+1)}(\tau)$ for $p=1,\ldots,255$.
+   slot ID. For sorted counts $n_{(1)},\ldots,n_{(64)}$, calculate
+   $\Delta_p(\tau)=n_{(p)}(\tau)-n_{(p+1)}(\tau)$ for $p=1,\ldots,63$.
 3. Choose the threshold and cut position with the greatest gap. On ties,
    keep the most vectors (largest $p$), then choose the lowest $\tau$.
 4. Keep the first $p$ summaries. If every gap at every threshold is zero,
-   keep all 256 and record $\tau=0$ as the deterministic fallback.
+   keep all 64 and record $\tau=0$ as the deterministic fallback.
 
 Concatenate the retained vectors across the document's chunks. The cutoff
 can differ between chunks; it is not a fixed removal percentage. The
