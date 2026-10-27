@@ -72,7 +72,7 @@ The following are target requirements, not a runnable replacement YAML:
 | Summary capacity | `model.num_summary_tokens: 128` per chunk |
 | Query slots | `model.query_max_len: 64` for ordinary queries and keypoints |
 | Query adapter structure | Retain `n_query_adapter_layers: 2` and `n_query_adapter_heads: 8` |
-| Compressor structure | Retain `n_cross_attn_layers: 1` complete refinement block and `n_cross_attn_heads: 8` for its cross-attention and self-attention |
+| Compressor structure | Default `n_cross_attn_layers: 6` complete refinement blocks, `n_cross_attn_heads: 8` for cross-attention and self-attention, 4x FFN expansion, and one final LayerNorm |
 | Keypoint matching weight | Remove the loss and its configuration field |
 | Gate and sparsity settings | Remove gate-dependent behavior and sparsity configuration |
 | Relevance objective | Teacher soft-target BCE; no InfoNCE term |
@@ -288,8 +288,9 @@ and the chunk, query, and summary budgets:
 | Query adapter | Two pre-norm Transformer encoder layers; eight self-attention heads per layer; FFN width 4096, GELU, dropout 0 |
 | Query output | `LayerNorm(X_Q + F_Q(X_Q))`; includes an outer residual in addition to each layer's internal residuals |
 | Summary initialization | One trainable `(128, 1024)` matrix, reused for every chunk |
-| Summary block | One block by default: cross-attention, FFN1, self-attention, FFN2; eight heads in both attention modules; pre-norm and a residual at each stage |
-| Compressor FFNs | Separate `Linear(1024, 4096) -> GELU -> Linear(4096, 1024)` networks; dropout 0 |
+| Summary blocks | Six blocks by default, each with cross-attention, FFN1, self-attention, FFN2; eight heads in both attention modules; pre-norm and a residual at each stage |
+| Compressor FFNs | Separate `Linear(1024, 4096) -> GELU -> Linear(4096, 1024)` networks in each block; 4x expansion; dropout 0 |
+| Summary output | One final trainable `LayerNorm(1024)` after all six blocks, before concatenating chunk summaries |
 | Document scoring | Concatenate chunk summaries; form query-to-summary scaled dot products; take the maximum per query slot and sum all 64 maxima |
 
 The query adapter adds no positional encoding and uses bidirectional
@@ -297,8 +298,9 @@ self-attention over all 64 slots, including fill slots. This adapter behavior
 is separate from the frozen document encoder's native attention. In summary
 cross-attention, use separate trainable query and key/value LayerNorm modules
 and mask padded chunk tokens. Keep those normalization and projection layers
-outside the frozen encoder's `no_grad` region. The current block structure
-has no additional final compressor LayerNorm.
+outside the frozen encoder's `no_grad` region. After the last refinement
+block, apply the final compressor LayerNorm across each summary vector's
+hidden dimension; this normalization also remains trainable.
 
 The revised output contract should expose these tensors. Names are proposed
 interfaces to implement, not a claim that the current outputs already obey
