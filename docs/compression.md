@@ -289,8 +289,7 @@ $$
 +\lambda_{\mathrm{assign}}\mathcal L_{\mathrm{assign}}.
 $$
 
-For the first experiment, use these defaults with the $\log M$-normalized
-assignment loss defined above:
+By default, the parameters are:
 
 $$
 \lambda_{\mathrm{cov}}=1.0,\qquad
