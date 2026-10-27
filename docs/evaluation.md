@@ -48,8 +48,7 @@ the rule to favor test-set metrics is not a validation procedure.
 Load the encoder revision and tokenizer recorded with the run. Keep every
 encoder parameter frozen and run evaluation with gradient recording disabled
 and the model in evaluation mode. Load only the trainable components that
-belong to the revised architecture, including the query adapter and relevance
-calibration parameters if present.
+belong to the revised architecture: the compressor and query adapter.
 
 ## Encode documents and retain the reference tokens
 
@@ -213,8 +212,8 @@ those retained summaries belonging to the document. There is no gate
 multiplier. Preserve the training score definition; do not substitute
 cosine retrieval scoring just because selection uses cosine similarities.
 Rank complete candidate documents by descending raw score and resolve exact
-ties by ascending stable document ID. A shared positive score scale, bias,
-and sigmoid preserve ordering and are unnecessary for ranking.
+ties by ascending stable document ID. The raw score is also the BCE logit;
+apply sigmoid only when reporting relevance probabilities.
 
 ### Precision@1 and mean reciprocal rank
 

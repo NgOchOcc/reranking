@@ -21,7 +21,7 @@ Existing commands still run the earlier model described in the status table.
 | Keypoints | Additional positive queries through the ordinary query path | Separate full-backbone keypoint encoding and matching loss |
 | Query length | 64 token slots for all query types, including keypoints | 32 slots for ordinary queries; full-length keypoints in a separate encoder branch |
 | Encoder attention | Native pretrained attention behavior | Bidirectional attention patch |
-| Relevance training | Teacher soft-target BCE for all selected query/document pairs | Teacher soft-target BCE against each query row's source document |
+| Relevance training | Teacher soft-target BCE on raw MaxSim logits for all selected query/document pairs | Teacher soft-target BCE against each query row's source document, with learned score scale and bias |
 | Training coverage | Keep IDF-weighted token coverage against frozen encoder states | IDF-weighted token coverage against trainable encoder states |
 | Gates | Direct summary vectors, with no learned multiplicative gate in the revised scoring path | Sigmoid gate head and gated summaries |
 | Sparsity | Removed | Summed-gate sparsity loss |
@@ -75,7 +75,7 @@ The following are target requirements, not a runnable replacement YAML:
 | Compressor structure | Default `n_cross_attn_layers: 6` complete refinement blocks, `n_cross_attn_heads: 8` for cross-attention and self-attention, 4x FFN expansion, and one final LayerNorm |
 | Keypoint matching weight | Remove the loss and its configuration field |
 | Gate and sparsity settings | Remove gate-dependent behavior and sparsity configuration |
-| Relevance objective | Teacher soft-target BCE; no InfoNCE term |
+| Relevance objective | Teacher soft-target BCE on raw MaxSim logits; no InfoNCE term |
 | Coverage objective | Keep IDF-weighted token coverage |
 | Encoder attention | Native pretrained attention; remove the bidirectional patch from this path |
 | Post-training thresholds | `0, 0.25, 0.5, 0.75, 0.9` |
@@ -177,10 +177,10 @@ terms for both `(query, negative document)` and `(negative query, document)`.
 A selected negative candidate that receives a high teacher score keeps that
 soft target; never overwrite it with zero to match the sampling role.
 
-For each valid pair, compute the student's full-document MaxSim score,
-apply the shared positive scale and bias, and pass the resulting logit to
-numerically stable BCE-with-logits against the teacher probability. Flatten
-all selected pair types into one mean over valid pairs. Missing targets
+For each valid pair, compute the student's full-document MaxSim score
+and pass it directly as the logit to numerically stable BCE-with-logits
+against the teacher probability. Flatten all selected pair types into one
+mean over valid pairs. Missing targets
 contribute neither a loss nor a count; they are not zero-probability targets.
 There is no separate InfoNCE or keypoint-matching term.
 
@@ -332,11 +332,11 @@ slots. Document packing padding must be masked before the maximum. Removing
 a summary means physically excluding it or masking its similarity to
 negative infinity; replacing it with zero can change rankings incorrectly.
 
-Retain the existing shared positive scale and bias for BCE calibration:
-`logit = softplus(score_alpha) * MaxSim + score_bias`, using its numerical
-positive floor. Apply sigmoid only when reporting relevance probabilities;
-feed raw logits into BCE-with-logits. Use raw MaxSim scores for ranking to
-avoid sigmoid saturation producing numerical ties.
+Use `logit = MaxSim` directly for BCE. Remove the learned score scale and
+bias (`score_alpha` and `score_bias`) from the revised model and its optimizer
+parameters. Apply sigmoid only when reporting relevance probabilities;
+feed raw MaxSim scores into BCE-with-logits. Use raw MaxSim scores for ranking
+to avoid sigmoid saturation producing numerical ties.
 
 ## 7. Training loop, artifacts, and post-training selection
 

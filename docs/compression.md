@@ -87,8 +87,7 @@ flowchart TB
     subgraph SCORE["Document scoring"]
         DOT["Scaled dot-product matrix<br/>64 x 128 J_D"] --> MAX["Maximum over document vectors<br/>64 best-match scores"]
         MAX --> SUM["Sum over query slots<br/>Raw MaxSim score"]
-        SUM --> CAL["Trainable positive scale and bias"]
-        CAL --> P["Sigmoid relevance probability"]
+        SUM --> P["Sigmoid relevance probability"]
     end
 
     QLN --> DOT
@@ -96,7 +95,7 @@ flowchart TB
     classDef frozen fill:#e8f2ff,stroke:#34699a,color:#111;
     classDef trainable fill:#fff1d6,stroke:#9a6b22,color:#111;
     class EMB,XQ,ENC,H frozen;
-    class FQ,QLN,Z,CA,FF1,SA,FF2,CAL trainable;
+    class FQ,QLN,Z,CA,FF1,SA,FF2 trainable;
 ```
 
 Blue nodes contain frozen parameters or fixed features; orange nodes contain
@@ -183,11 +182,11 @@ with each target. A different candidate document requires its own teacher
 score. Positive/negative pair labels guide sampling; they do not replace
 the teacher probability with a hard 1 or 0.
 
-Convert the student's raw score to a relevance logit using a learned positive
-scale and bias:
+Use the student's raw MaxSim score directly as the relevance logit. The
+predicted relevance probability is:
 
 $$
-z(Q,D)=a\,s(Q,D)+b,\qquad a=\operatorname{softplus}(\alpha)>0.
+p_S(Q,D)=\sigma(s(Q,D)).
 $$
 
 With $\mathcal P$ the valid selected pairs, compute stable soft-target BCE:
@@ -195,8 +194,11 @@ With $\mathcal P$ the valid selected pairs, compute stable soft-target BCE:
 $$
 \mathcal L_{\mathrm{BCE}}=
 \frac{1}{|\mathcal P|}\sum_{(Q,D)\in\mathcal P}
-\left[\operatorname{softplus}(z(Q,D))-p_T(Q,D)z(Q,D)\right].
+\left[\operatorname{softplus}(s(Q,D))-p_T(Q,D)s(Q,D)\right].
 $$
+
+Pass the raw score directly to BCE-with-logits; use sigmoid only to report
+relevance probabilities.
 
 Average source-document and other-document pairs together. Missing pairs
 or teacher targets are masked out, never interpreted as zero relevance.
@@ -234,9 +236,9 @@ $$
 \lambda_{\mathrm{cov}}=1.0.
 $$
 
-Only the summary queries, refinement blocks, query adapter, and score scale
-and bias are optimized. The embedding encoder and input embedding
-table stay fixed throughout compressor training. No gradient flows through
+Only the summary queries, refinement blocks, and query adapter are
+optimized. The embedding encoder and input embedding table stay fixed
+throughout compressor training. No gradient flows through
 the token reference vectors or reranker teacher.
 
 ## 5. Select vectors after training
