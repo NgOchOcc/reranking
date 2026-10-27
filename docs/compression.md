@@ -228,13 +228,79 @@ zero-weight chunks, without repeating coverage for each associated query.
 Exclude padding and compute cosine normalization in float32 with a small
 norm epsilon. Coverage gradients update the compressor; $H_r$ stays fixed.
 
-The complete objective has just two terms:
+**Assignment regularization encourages summary specialization.** For a
+chunk with $W_r>0$, define normalized token weights
+$\omega_{r,j}=w_{r,j}/W_r$ and similarities between frozen token vectors and
+the final summary vectors used by coverage:
+
+$$
+c_{r,jk}=\cos(h_{r,j},s_{r,k}),\qquad
+P_{r,jk}=\frac{\exp(c_{r,jk}/T)}
+{\sum_{\ell=1}^{M}\exp(c_{r,j\ell}/T)},\qquad T>0.
+$$
+
+The softmax runs over the $M=128$ summaries for each real token, rather
+than over tokens. These assignments are computed from output similarities,
+not from the compressor's internal attention weights. Define each summary's
+share of the chunk's IDF-weighted token mass as
+
+$$
+u_{r,k}=\sum_{j=1}^{\ell_r}\omega_{r,j}P_{r,jk},\qquad
+\sum_{k=1}^{M}u_{r,k}=1.
+$$
+
+Let $H(p)=-\sum_k p_k\log p_k$, with $0\log0=0$. Combine a preference for
+balanced summary usage with confident token assignments:
+
+$$
+\mathcal L_{\mathrm{assign}}(C_r)=
+\frac{
+\underbrace{\sum_{k=1}^{M}u_{r,k}\log(Mu_{r,k})}_{\text{usage balance}}
++\underbrace{\sum_{j=1}^{\ell_r}\omega_{r,j}H(P_{r,j:})}_{\text{assignment confidence}}
+}{\log M}.
+$$
+
+The first term is $D_{\mathrm{KL}}(u_r\|\operatorname{Uniform}(M))$;
+the second discourages assigning each token equally to every summary.
+Balancing alone gives zero penalty when all summaries are identical and
+assignments are uniform. The combined loss instead favors summaries that
+serve different tokens, without guaranteeing recovery from exact symmetric
+collapse. It equals $1-I(J;K)/\log M$ under the joint distribution
+$\Pr(J=j,K=k)=\omega_{r,j}P_{r,jk}$, so minimizing it maximizes token-to-summary
+mutual information.
+
+Compute assignments independently within each unique chunk, before
+post-training vector selection. Exclude padding, use float32 stable softmax
+and entropy calculations, and retain gradients through the assignments to
+the summary vectors; the encoder features remain frozen. For $W_r=0$, define
+the chunk's assignment loss as zero without dividing by $W_r$. Average over
+all $N_c$ unique chunks, including zero-weight chunks:
+
+$$
+\mathcal L_{\mathrm{assign}}=
+\frac{1}{N_c}\sum_{r=1}^{N_c}\mathcal L_{\mathrm{assign}}(C_r).
+$$
+
+The complete objective has three terms:
 
 $$
 \mathcal L=\mathcal L_{\mathrm{BCE}}
-+\lambda_{\mathrm{cov}}\mathcal L_{\mathrm{cov}},\qquad
-\lambda_{\mathrm{cov}}=1.0.
++\lambda_{\mathrm{cov}}\mathcal L_{\mathrm{cov}}
++\lambda_{\mathrm{assign}}\mathcal L_{\mathrm{assign}}.
 $$
+
+For the first experiment, use these defaults with the $\log M$-normalized
+assignment loss defined above:
+
+$$
+\lambda_{\mathrm{cov}}=1.0,\qquad
+\lambda_{\mathrm{assign}}=0.1,\qquad T=0.1.
+$$
+
+These are fixed starting hyperparameters to tune on validation data. Keep
+the assignment coefficient small: short or repetitive chunks may legitimately
+need fewer distinct summaries. Setting $\lambda_{\mathrm{assign}}=0$ recovers
+BCE plus coverage.
 
 Only the summary queries, refinement blocks, and query adapter are
 optimized. The embedding encoder and input embedding table stay fixed
