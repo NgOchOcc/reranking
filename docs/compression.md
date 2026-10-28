@@ -79,8 +79,7 @@ flowchart TB
         Z["Trainable initial summary queries<br/>128 x 1024"] -->|Queries| CA["Cross-attention + residual"]
         H -->|Keys and values| CA
         CA --> FF1["FFN1 + residual"]
-        FF1 --> SA["Summary self-attention + residual"]
-        SA --> FF2["FFN2 + residual<br/>Chunk summaries: 128 x 1024"]
+        FF1 --> FF2["FFN2 + residual<br/>Chunk summaries: 128 x 1024"]
         FF2 --> CAT["Concatenate summaries from all chunks<br/>Document vectors: 128 J_D x 1024"]
     end
 
@@ -95,7 +94,7 @@ flowchart TB
     classDef frozen fill:#e8f2ff,stroke:#34699a,color:#111;
     classDef trainable fill:#fff1d6,stroke:#9a6b22,color:#111;
     class EMB,XQ,ENC,H frozen;
-    class FQ,QLN,Z,CA,FF1,SA,FF2 trainable;
+    class FQ,QLN,Z,CA,FF1,FF2 trainable;
 ```
 
 Blue nodes contain frozen parameters or fixed features; orange nodes contain
@@ -106,9 +105,10 @@ pre-normalization and a residual around each operation. The outer residual
 shown in the diagram is additional to those internal residuals.
 
 In the compressor, cross-attention reads the frozen chunk tokens using the
-current summaries as queries. Summary self-attention exchanges information
-between the 128 slots. All four stages use pre-normalization and residual
-connections. Both compressor FFNs and the query-adapter FFNs use
+current summaries as queries, followed by FFN1 and FFN2 applied independently
+to each summary slot. All three stages use pre-normalization and residual
+connections. Summary self-attention is removed from the revised compressor.
+Both compressor FFNs and the query-adapter FFNs use
 `Linear(1024, 4096) -> GELU -> Linear(4096, 1024)`; the two compressor FFNs
 have separate weights.
 

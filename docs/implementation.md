@@ -18,6 +18,7 @@ Existing commands still run the earlier model described in the status table.
 | Coverage reference | Reuse the same frozen encoder's contextual token states | Current coverage uses trainable student token states |
 | Chunk size | 2048 tokens; complete documents split into chunks | 1024 tokens per chunk |
 | Summary count | 128 slots per chunk before post-training selection | 32 slots per chunk |
+| Summary refinement | Cross-attention, FFN1, then FFN2; no summary self-attention | Cross-attention, FFN1, summary self-attention, then FFN2 |
 | Keypoints | Additional positive queries through the ordinary query path | Separate full-backbone keypoint encoding and matching loss |
 | Query length | 64 token slots for all query types, including keypoints | 32 slots for ordinary queries; full-length keypoints in a separate encoder branch |
 | Encoder attention | Native pretrained attention behavior | Bidirectional attention patch |
@@ -72,7 +73,7 @@ The following are target requirements, not a runnable replacement YAML:
 | Summary capacity | `model.num_summary_tokens: 128` per chunk |
 | Query slots | `model.query_max_len: 64` for ordinary queries and keypoints |
 | Query adapter structure | Retain `n_query_adapter_layers: 2` and `n_query_adapter_heads: 8` |
-| Compressor structure | Default `n_cross_attn_layers: 6` complete refinement blocks, `n_cross_attn_heads: 8` for cross-attention and self-attention, 4x FFN expansion, and one final LayerNorm |
+| Compressor structure | Default `n_cross_attn_layers: 6` refinement blocks, each with cross-attention followed by FFN1 and FFN2; `n_cross_attn_heads: 8` for cross-attention, 4x FFN expansion, and one final LayerNorm |
 | Keypoint matching weight | Remove the loss and its configuration field |
 | Gate and sparsity settings | Remove gate-dependent behavior and sparsity configuration |
 | Relevance objective | Teacher soft-target BCE on raw MaxSim logits; no InfoNCE term |
@@ -274,13 +275,16 @@ training objective.
 
 The current summary block performs residual pre-norm cross-attention,
 FFN1, summary self-attention, then FFN2. Learned initial summary queries are
-shared across chunks. Preserve the distinction between contextual encoder
-states and compressed summary vectors.
+shared across chunks. For the revised compressor, remove the summary
+self-attention module and its LayerNorm, leaving cross-attention, FFN1,
+then FFN2 with pre-normalization and residual connections at all three
+stages. Preserve the distinction between contextual encoder states and
+compressed summary vectors.
 
 The [architecture diagram](compression.md#2-query-encoding-and-document-scoring)
-shows these blocks at the revised dimensions. Retain the existing block
-structures and 1024-wide hidden states while updating freezing behavior
-and the chunk, query, and summary budgets:
+shows these blocks at the revised dimensions. Retain 1024-wide hidden
+states while removing summary self-attention, updating freezing behavior,
+and changing the chunk, query, and summary budgets:
 
 | Component | Revised architecture |
 |---|---|
@@ -288,7 +292,7 @@ and the chunk, query, and summary budgets:
 | Query adapter | Two pre-norm Transformer encoder layers; eight self-attention heads per layer; FFN width 4096, GELU, dropout 0 |
 | Query output | `LayerNorm(X_Q + F_Q(X_Q))`; includes an outer residual in addition to each layer's internal residuals |
 | Summary initialization | One trainable `(128, 1024)` matrix, reused for every chunk |
-| Summary blocks | Six blocks by default, each with cross-attention, FFN1, self-attention, FFN2; eight heads in both attention modules; pre-norm and a residual at each stage |
+| Summary blocks | Six blocks by default, each with cross-attention, FFN1, then FFN2; eight cross-attention heads; pre-norm and a residual at each stage; no summary self-attention |
 | Compressor FFNs | Separate `Linear(1024, 4096) -> GELU -> Linear(4096, 1024)` networks in each block; 4x expansion; dropout 0 |
 | Summary output | One final trainable `LayerNorm(1024)` after all six blocks, before concatenating chunk summaries |
 | Document scoring | Concatenate chunk summaries; form query-to-summary scaled dot products; take the maximum per query slot and sum all 64 maxima |
